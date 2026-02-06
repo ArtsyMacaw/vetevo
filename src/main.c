@@ -1,3 +1,4 @@
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -6,11 +7,16 @@
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_sntp.h"
+#include "esp_netif_sntp.h"
 #include "nvs_flash.h"
 #include "secret.h" // Not included in repo
 /* Defines:
  * - WIFI_SSID
  * - WIFI_PASSWORD
+ *   LATITUDE
+ *   LONGITUDE
+ *   API_KEY
  * - API_PATH (the path portion of the URL for the OpenWeather API, including query parameters)
  */
 
@@ -152,7 +158,7 @@ static void https_get_task()
     esp_http_client_config_t config =
     {
         .host = "api.openweathermap.org",
-        .path = API_PATH,
+        .path = "/data/2.5/weather?qunits=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&appid=" API_KEY,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .event_handler = http_event_handler,
         .cert_pem = (char *)server_cert_pem_start
@@ -201,5 +207,28 @@ void app_main()
 
     wifi_init_sta();
 
-    https_get_task();
+    // Temperally commented out to avoid hitting API limits during dev
+    // https_get_task();
+
+    // RTC clock can drift so sync it needs to be synced with an NTP server periodically
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_config);
+    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
+    tzset();
+
+    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK)
+    {
+        ESP_LOGE("sntp", "Failed to synchronize time");
+    }
+    else
+    {
+        ESP_LOGI("sntp", "Time synchronized successfully");
+    }
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    ESP_LOGI("sntp", "Current time: %s", asctime(&timeinfo));
+
+    esp_netif_sntp_deinit();
 }
