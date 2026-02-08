@@ -1,3 +1,4 @@
 .pio
 secret.h
 *.vcxproj*
+sdkconfig*
