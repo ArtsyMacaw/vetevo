@@ -11,13 +11,16 @@
 #include "esp_netif_sntp.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "display.h"
 #include "secret.h" // Not included in repo
 /* Defines:
  * - WIFI_SSID
  * - WIFI_PASSWORD
- *   LATITUDE
- *   LONGITUDE
- *   API_KEY
+ * - LATITUDE
+ * - LONGITUDE
+ * - API_KEY
  */
 
 // TODO: At some point see if I can check with Valgrind for memory leaks
@@ -29,12 +32,12 @@ static int retry_num = 0;
 #define WIFI_FAIL_BIT      BIT1
 #define MAX_RETRY_NUM 5
 
-// Root server certificate for api.openweathermap.org embedded by CMake
+/* Root server certificate for api.openweathermap.org embedded by CMake */
 extern const uint8_t server_cert_pem_start[] asm("_binary_openweather_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_openweather_pem_end");
 
-// Current weather conditions doesn't store all returned data from API just
-// those that are displayed
+/* Current weather conditions doesn't store all returned data from API
+ * just those that are displayed */
 static struct weather_today
 {
     char description[32];
@@ -45,11 +48,9 @@ static struct weather_today
     float precipitation; // mm of rain/snow in the last hour
     uint8_t cloudiness;
 };
-
 static struct weather_today weather;
 
 #define FORECAST_DAYS 5
-
 static struct weather_forecast
 {
     char description[32];
@@ -59,14 +60,13 @@ static struct weather_forecast
     float precipitation_chance;
     uint8_t cloudiness;
 };
-
 static struct weather_forecast forecast[FORECAST_DAYS];
 
 // TODO: Check esp_err_t return value
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    // Most of these events should never happen,
-    // but I'm including them for completeness and debugging purposes
+    /* Most of these events should never happen, but I'm including them
+     * for completeness and debugging purposes */
     switch (evt->event_id)
     {
         case HTTP_EVENT_ERROR:
@@ -127,18 +127,18 @@ void wifi_init_sta()
     // TODO: If ESP_ERROR returns an error restart the board and try again.
     // preferably the ULP should continue to update the time on the display
 
-    // Default event loop must be created before create_default_wifi_sta() is called
+    /* Default event loop must be created before create_default_wifi_sta() is called */
     wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
 
-    // Create Network Interface
+    /* Create Network Interface */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_init(&cfg));
 
-    // Setup event loop and handlers
+    /* Setup event loop and handlers */
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(WIFI_EVENT,
@@ -152,7 +152,7 @@ void wifi_init_sta()
                                                                 NULL,
                                                                 &instance_got_ip));
 
-    // Configure Wi-Fi connection and start the interface
+    /* Configure Wi-Fi connection and start the interface */
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
@@ -162,11 +162,11 @@ void wifi_init_sta()
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    // Start Wi-Fi
+    /* Start Wi-Fi */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
     ESP_LOGI("wifi", "Wi-Fi initialization completed.");
 
-    // Wait for connection or failure
+    /* Wait for connection or failure */
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
@@ -211,7 +211,7 @@ static void https_get_task()
     int content_length = esp_http_client_fetch_headers(client);
 
     char *buffer = malloc(content_length + 1);
-    assert(buffer != NULL); // malloc shouldn't unless there's a memory leak
+    assert(buffer != NULL); // malloc shouldn't fail unless there's a memory leak
     int read_len = esp_http_client_read(client, buffer, content_length);
     if (read_len >= 0)
     {
@@ -223,7 +223,7 @@ static void https_get_task()
         ESP_LOGE("http", "Failed to read response");
     }
 
-    // Parse JSON response and populate the weather struct
+    /* Parse JSON response and populate the weather struct */
     cJSON *json = cJSON_ParseWithLength(buffer, content_length);
     if (json == NULL)
     {
@@ -288,7 +288,7 @@ static void https_get_task()
             ESP_LOGI("weather", "Cloudiness: %d%%", weather.cloudiness);
         }
 
-        // Won't return anything if it hasn't rained in the last hour
+        /* Won't return anything if it hasn't rained in the last hour */
         cJSON *rain = cJSON_GetObjectItem(json, "rain");
         if (cJSON_IsObject(rain))
         {
@@ -320,7 +320,7 @@ static void https_get_task()
     content_length = esp_http_client_fetch_headers(client);
     buffer = malloc(content_length + 1);
     assert(buffer != NULL);
-    int read_len = esp_http_client_read(client, buffer, content_length);
+    read_len = esp_http_client_read(client, buffer, content_length);
     if (read_len >= 0)
     {
         buffer[read_len] = '\0';
@@ -331,7 +331,7 @@ static void https_get_task()
         ESP_LOGE("http", "Failed to read response");
     }
 
-    // Parse JSON response and populate the forecast array; data updates every three hours
+    /* Parse JSON response and populate the forecast array; data updates every three hours */
     json = cJSON_ParseWithLength(buffer, content_length);
     if (json == NULL)
     {
@@ -404,7 +404,7 @@ static void https_get_task()
 
 void sync_sntp_time()
 {
-    // RTC clock can drift so sync it needs to be synced with an NTP server periodically
+    /* RTC clock can drift substantially, so sync it needs to be synced with an NTP server periodically */
     time_t now = 0;
     struct tm timeinfo = { 0 };
     esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
@@ -426,9 +426,130 @@ void sync_sntp_time()
     esp_netif_sntp_deinit();
 }
 
+static void SPI_write_byte(UBYTE data)
+{
+    for (int i = 0; i < 8; i++)
+    {
+        gpio_set_level(MOSI_PIN, (data & 0x80) ? HIGH : LOW);
+        data <<= 1;
+        gpio_set_level(SCK_PIN, HIGH);
+        gpio_set_level(SCK_PIN, LOW);
+    }
+
+    gpio_set_level(CS_PIN, HIGH);
+}
+
+static void SPI_write_command(UBYTE command)
+{
+    gpio_set_level(DC_PIN, LOW); // Command mode
+    gpio_set_level(CS_PIN, LOW);
+    SPI_write_byte(command);
+}
+
+static void SPI_write_data(UBYTE data)
+{
+    gpio_set_level(DC_PIN, HIGH); // Data mode
+    gpio_set_level(CS_PIN, LOW);
+    SPI_write_byte(data);
+}
+
+static void epd_reset()
+{
+    gpio_set_level(RST_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(RST_PIN, LOW);
+    vTaskDelay(pdMS_TO_TICKS(40));
+    gpio_set_level(RST_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+static void epd_wait_until_idle()
+{
+    while (gpio_get_level(BUSY_PIN) == HIGH)
+    {
+        ESP_LOGI("epd", "Display is busy...");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI("epd", "Display released from busy state");
+}
+
+static void epd_init()
+{
+    epd_reset();
+
+    /* Currently all settings are left at their defaults
+     * because I have no idea what they do */
+    SPI_write_command(BOOSTER_SOFT_START);
+    SPI_write_data(0x17);
+    SPI_write_data(0x17);
+    SPI_write_data(0x27);
+    SPI_write_data(0x17);
+
+    SPI_write_command(POWER_SETTING);
+    SPI_write_data(0x07);
+    SPI_write_data(0x17);
+    SPI_write_data(0x3f);
+    SPI_write_data(0x3f);
+
+    SPI_write_command(POWER_ON);
+    epd_wait_until_idle();
+
+    SPI_write_command(PANEL_SETTING);
+    SPI_write_data(0x1f);
+
+    SPI_write_command(RESOLUTION_SETTING);
+    SPI_write_data(0x03);
+    SPI_write_data(0x20);
+    SPI_write_data(0x01);
+    SPI_write_data(0xe0);
+
+    SPI_write_command(DUAL_SPI);
+    SPI_write_data(0x00);
+
+    SPI_write_command(TCON_SETTING);
+    SPI_write_data(0x22);
+
+    SPI_write_command(VCOM_DATA_INTERVAL);
+    SPI_write_data(0x10);
+    SPI_write_data(0x07);
+}
+
+static void epd_clear()
+{
+    epd_wait_until_idle();
+    SPI_write_command(TRANSFER_DATA_2);
+    for (unsigned long i = 0; i < ((EPD_HEIGHT * EPD_WIDTH) / 8); i++)
+    {
+        SPI_write_data(0x00);
+    }
+    SPI_write_command(DISPLAY_REFRESH);
+    epd_wait_until_idle();
+}
+
+static void epd_write_frame(UBYTE *frame)
+{
+    epd_wait_until_idle();
+    /* The display is black and white so each byte represents 8 pixels, with 0s being black and 1s being white. */
+    SPI_write_command(TRANSFER_DATA_2);
+    for (unsigned long i = 0; i < ((EPD_HEIGHT * EPD_WIDTH) / 8); i++)
+    {
+        SPI_write_data(0xff);
+    }
+    SPI_write_command(DISPLAY_REFRESH);
+    epd_wait_until_idle();
+}
+
+static void epd_sleep()
+{
+    SPI_write_command(POWER_OFF);
+    epd_wait_until_idle();
+    SPI_write_command(DEEP_SLEEP);
+    SPI_write_data(0xA5);
+}
+
 void app_main()
 {
-    // Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize
+    /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -440,4 +561,34 @@ void app_main()
     sync_sntp_time();
 
     https_get_task();
+
+    /* CS pin being held low is what tells the display to listen for data,
+     * so set it high when not sending data */
+    gpio_reset_pin(CS_PIN);
+    gpio_set_direction(CS_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(CS_PIN, HIGH);
+
+    /* DC pin determines whether the byte being sent is as a command or data */
+    gpio_reset_pin(DC_PIN);
+    gpio_set_direction(DC_PIN, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(RST_PIN);
+    gpio_set_direction(RST_PIN, GPIO_MODE_OUTPUT);
+
+    /* BUSY pin is an input that the display holds high when it's busy processing data, so the microcontroller
+     * knows not to send more data until it goes low again */
+    gpio_reset_pin(BUSY_PIN);
+    gpio_set_direction(BUSY_PIN, GPIO_MODE_INPUT);
+
+    gpio_reset_pin(MOSI_PIN);
+    gpio_set_direction(MOSI_PIN, GPIO_MODE_OUTPUT);
+
+    /* SCK pin is used to clock in the data on the MOSI pin, so it should be low when not sending data */
+    gpio_reset_pin(SCK_PIN);
+    gpio_set_direction(SCK_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(SCK_PIN, LOW);
+
+    epd_init();
+    epd_write_frame(NULL);
+    epd_sleep();
 }
