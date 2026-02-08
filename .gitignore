@@ -1,2 +1,3 @@
 .pio
 secret.h
+*.vcxproj*
