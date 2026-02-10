@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "display.h"
+#include "fonts.h"
 #include "secret.h" // Not included in repo
 /* Defines:
  * - WIFI_SSID
@@ -47,8 +48,7 @@ static struct weather_today
     float wind_speed;
     float precipitation; // mm of rain/snow in the last hour
     uint8_t cloudiness;
-};
-static struct weather_today weather;
+} weather;
 
 #define FORECAST_DAYS 5
 static struct weather_forecast
@@ -59,8 +59,9 @@ static struct weather_forecast
     float wind_speed;
     float precipitation_chance;
     uint8_t cloudiness;
-};
-static struct weather_forecast forecast[FORECAST_DAYS];
+} forecast[FORECAST_DAYS];
+
+static UBYTE frame[EPD_HEIGHT][EPD_WIDTH / 8]; // Each byte represents 8 pixels, so width is divided by 8
 
 // TODO: Check esp_err_t return value
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -122,7 +123,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-void wifi_init_sta()
+static void wifi_init_sta()
 {
     // TODO: If ESP_ERROR returns an error restart the board and try again.
     // preferably the ULP should continue to update the time on the display
@@ -186,6 +187,8 @@ void wifi_init_sta()
     }
 
 }
+
+//TODO: Create wifi cleanup function that destroys everything
 
 static void https_get_task()
 {
@@ -402,13 +405,14 @@ static void https_get_task()
     free(buffer);
 }
 
-void sync_sntp_time()
+static void sync_sntp_time()
 {
     /* RTC clock can drift substantially, so sync it needs to be synced with an NTP server periodically */
     time_t now = 0;
     struct tm timeinfo = { 0 };
     esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_netif_sntp_init(&sntp_config);
+    /* POSIX timezones */
     setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
     tzset();
 
@@ -475,6 +479,8 @@ static void epd_wait_until_idle()
 
 static void epd_init()
 {
+    /* Datasheet at https://files.waveshare.com/upload/6/60/7.5inch_e-Paper_V2_Specification.pdf
+     * was used as a reference for the initialization sequence and commands */
     epd_reset();
 
     /* Currently all settings are left at their defaults
@@ -526,14 +532,17 @@ static void epd_clear()
     epd_wait_until_idle();
 }
 
-static void epd_write_frame(UBYTE *frame)
+static void epd_write_frame()
 {
     epd_wait_until_idle();
     /* The display is black and white so each byte represents 8 pixels, with 0s being black and 1s being white. */
     SPI_write_command(TRANSFER_DATA_2);
-    for (unsigned long i = 0; i < ((EPD_HEIGHT * EPD_WIDTH) / 8); i++)
+    for (unsigned long i = 0; i < EPD_HEIGHT; i++)
     {
-        SPI_write_data(0xff);
+        for (unsigned long j = 0; j < EPD_WIDTH / 8; j++)
+        {
+            SPI_write_data(frame[i][j]);
+        }
     }
     SPI_write_command(DISPLAY_REFRESH);
     epd_wait_until_idle();
@@ -547,6 +556,45 @@ static void epd_sleep()
     SPI_write_data(0xA5);
 }
 
+static void frame_draw_char(font_t font, char c, int x, int y)
+{
+    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT)
+    {
+        ESP_LOGE("frame", "Character position out of bounds: x=%d, y=%d", x, y);
+        return;
+    }
+
+    int closest_x = x / 8; // Find the closest byte boundary to the left of the desired x position
+    int bytes_per_char = font.width / 8 + (font.width % 8 != 0); // Calculate bytes per character in font data
+
+    /* Subtract the first character in the font from the character to get the index,
+     * then multiply by the number of bytes per character to get the offset in the font data array */
+    uint32_t offset = (c - ' ') * font.height * bytes_per_char;
+    const unsigned char *char_start = font.table + offset;
+
+    /* Convert the 1D font data array for the character into a 2D array
+     * for easier indexing when drawing to the frame buffer. */
+    const unsigned char char_2d[font.height][bytes_per_char];
+    memcpy(char_2d, char_start, sizeof(char_2d));
+
+    for (int i = 0; i < font.height; i++)
+    {
+        for (int j = 0; j < bytes_per_char; j++)
+        {
+            /* If the character is aligned with a byte boundary then we can just OR the byte
+             * directly into the frame buffer. Otherwise we need to shift the bits to align
+             * them properly across two bytes in the frame buffer. */
+            if ((x % 8) == 0)
+            {
+                frame[y + i][closest_x + j] |= char_2d[i][j];
+            } else {
+                frame[y + i][closest_x + j] |= char_2d[i][j] >> (x % 8);
+                frame[y + i][closest_x + j + 1] |= char_2d[i][j] << (8 - (x % 8));
+            }
+        }
+    }
+}
+
 void app_main()
 {
     /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
@@ -557,10 +605,10 @@ void app_main()
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
 
-    wifi_init_sta();
-    sync_sntp_time();
+    //wifi_init_sta();
+    //sync_sntp_time();
 
-    https_get_task();
+    //https_get_task();
 
     /* CS pin being held low is what tells the display to listen for data,
      * so set it high when not sending data */
@@ -589,6 +637,17 @@ void app_main()
     gpio_set_level(SCK_PIN, LOW);
 
     epd_init();
-    epd_write_frame(NULL);
+    frame_draw_char(font16, 'H', 11, 10);
+    frame_draw_char(font16, 'E', 22, 10);
+    frame_draw_char(font16, 'L', 33, 10);
+    frame_draw_char(font16, 'L', 44, 10);
+    frame_draw_char(font16, 'O', 55, 10);
+    frame_draw_char(font16, ' ', 66, 10);
+    frame_draw_char(font16, 'W', 77, 10);
+    frame_draw_char(font16, 'O', 88, 10);
+    frame_draw_char(font16, 'R', 99, 10);
+    frame_draw_char(font16, 'L', 110, 10);
+    frame_draw_char(font16, 'D', 121, 10);
+    epd_write_frame();
     epd_sleep();
 }

@@ -38,4 +38,6 @@
 #define EPD_WIDTH 800
 #define EPD_HEIGHT 480
 
+extern unsigned char background[];
+
 #endif
