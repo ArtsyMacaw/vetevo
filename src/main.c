@@ -15,6 +15,7 @@
 #include "driver/spi_master.h"
 #include "display.h"
 #include "fonts.h"
+#include "icons.h"
 #include "secret.h" // Not included in repo
 /* Defines:
  * - WIFI_SSID
@@ -41,24 +42,29 @@ extern const uint8_t server_cert_pem_end[] asm("_binary_openweather_pem_end");
  * just those that are displayed */
 static struct weather_today
 {
+    uint16_t id; // Weather condition code that corresponds to an icon
     char description[32];
     float current_temp;
+    float feels_like_temp;
     float high_temp;
     float low_temp;
     float wind_speed;
     float precipitation; // mm of rain/snow in the last hour
-    uint8_t cloudiness;
+    float cloudiness; // % of sky covered by clouds
 } weather;
+
+// TODO: Switch to using hourly forecast API
 
 #define FORECAST_DAYS 5
 static struct weather_forecast
 {
+    uint16_t id; // Weather condition code that corresponds to an icon
     char description[32];
     float high_temp;
     float low_temp;
     float wind_speed;
     float precipitation_chance;
-    uint8_t cloudiness;
+    float cloudiness;
 } forecast[FORECAST_DAYS];
 
 static UBYTE frame[EPD_HEIGHT][EPD_WIDTH / 8]; // Each byte represents 8 pixels, so width is divided by 8
@@ -251,6 +257,12 @@ static void https_get_task()
             weather.description[sizeof(weather.description) - 1] = '\0';
             ESP_LOGI("weather", "Description: %s", weather.description);
         }
+        cJSON *id = cJSON_GetObjectItem(weather_item, "id");
+        if (cJSON_IsNumber(id))
+        {
+            weather.id = id->valueint;
+            ESP_LOGI("weather", "Weather ID: %d", weather.id);
+        }
 
         cJSON *main = cJSON_GetObjectItem(json, "main");
         assert(cJSON_IsObject(main));
@@ -259,6 +271,12 @@ static void https_get_task()
         {
             weather.current_temp = temp->valuedouble;
             ESP_LOGI("weather", "Current Temp: %.2f F", weather.current_temp);
+        }
+        cJSON *feels_like = cJSON_GetObjectItem(main, "feels_like");
+        if (cJSON_IsNumber(feels_like))
+        {
+            weather.feels_like_temp = feels_like->valuedouble;
+            ESP_LOGI("weather", "Feels Like Temp: %.2f F", weather.feels_like_temp);
         }
         cJSON *temp_min = cJSON_GetObjectItem(main, "temp_min");
         if (cJSON_IsNumber(temp_min))
@@ -307,6 +325,7 @@ static void https_get_task()
         }
     }
     free(buffer);
+    // TODO: cJSON_Delete should free every JSON object under it, but I should check with valgrind
     cJSON_Delete(json);
     esp_http_client_close(client);
 
@@ -396,6 +415,12 @@ static void https_get_task()
                 forecast[i].description[sizeof(forecast[i].description) - 1] = '\0';
                 ESP_LOGI("forecast", "Day %d Description: %s", i + 1, forecast[i].description);
             }
+            cJSON *id = cJSON_GetObjectItem(weather_item, "id");
+            if (cJSON_IsNumber(id))
+            {
+                forecast[i].id = id->valueint;
+                ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
+            }
         }
     }
 
@@ -434,12 +459,11 @@ static void SPI_write_byte(UBYTE data)
 {
     for (int i = 0; i < 8; i++)
     {
-        gpio_set_level(MOSI_PIN, (data & 0x80) ? HIGH : LOW);
+        gpio_set_level(MOSI_PIN, (data & 0x80) ? HIGH : LOW); // 0x80 = 10000000 BITMASK
         data <<= 1;
         gpio_set_level(SCK_PIN, HIGH);
         gpio_set_level(SCK_PIN, LOW);
     }
-
     gpio_set_level(CS_PIN, HIGH);
 }
 
@@ -556,15 +580,26 @@ static void epd_sleep()
     SPI_write_data(0xA5);
 }
 
-static void frame_draw_char(font_t font, char c, int x, int y)
+static void frame_draw_byte(int x, int y, uint8_t byte)
 {
     if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT)
     {
-        ESP_LOGE("frame", "Character position out of bounds: x=%d, y=%d", x, y);
+        ESP_LOGE("frame", "Byte position out of bounds: x=%d, y=%d", x, y);
         return;
     }
+    /* Shift the byte to align with the correct bits in the frame buffer, then OR it with the existing byte
+     * to preserve any pixels that have already been drawn in that byte. */
+    frame[y][x / 8] |= byte >> (x % 8);
+    /* If the byte being drawn isn't aligned to a byte boundary, then
+     * the byte next to it also needs to be updated with the remaining bits. */
+    if ((x % 8) != 0 && (x / 8 + 1) < (EPD_WIDTH / 8))
+    {
+        frame[y][x / 8 + 1] |= byte << (8 - (x % 8));
+    }
+}
 
-    int closest_x = x / 8; // Find the closest byte boundary to the left of the desired x position
+static void frame_draw_char(font_t font, char c, int x, int y)
+{
     int bytes_per_char = font.width / 8 + (font.width % 8 != 0); // Calculate bytes per character in font data
 
     /* Subtract the first character in the font from the character to get the index,
@@ -574,29 +609,100 @@ static void frame_draw_char(font_t font, char c, int x, int y)
 
     /* Convert the 1D font data array for the character into a 2D array
      * for easier indexing when drawing to the frame buffer. */
-    const unsigned char char_2d[font.height][bytes_per_char];
+    unsigned char char_2d[font.height][bytes_per_char];
     memcpy(char_2d, char_start, sizeof(char_2d));
 
     for (int i = 0; i < font.height; i++)
     {
         for (int j = 0; j < bytes_per_char; j++)
         {
-            /* If the character is aligned with a byte boundary then we can just OR the byte
-             * directly into the frame buffer. Otherwise we need to shift the bits to align
-             * them properly across two bytes in the frame buffer. */
-            if ((x % 8) == 0)
-            {
-                frame[y + i][closest_x + j] |= char_2d[i][j];
-            } else {
-                frame[y + i][closest_x + j] |= char_2d[i][j] >> (x % 8);
-                frame[y + i][closest_x + j + 1] |= char_2d[i][j] << (8 - (x % 8));
-            }
+            frame_draw_byte((x + (j * 8)), (y + i), char_2d[i][j]);
         }
     }
 }
 
+static void frame_draw_giant_char(uint32_t offset, int x, int y)
+{
+    uint32_t bytes_per_char = font60.width / 8 + (font60.width % 8 != 0);
+    const unsigned char *char_start = font60.table + offset;
+
+    for (int i = 0; i < font60.height; i++)
+    {
+        for (int j = 0; j < bytes_per_char; j++)
+        {
+            frame_draw_byte((x + (j * 8)), (y + i), char_start[i * bytes_per_char + j]);
+        }
+    }
+}
+
+static void frame_draw_string(font_t font, const char *str, int x, int y)
+{
+    while (str[0] != '\0')
+    {
+        /* Slightly cursed code to make periods look better */
+        x -= (str[0] == '.' && font.width < 20) ? ((font.width / 2) - 1) : 0;
+        frame_draw_char(font, *str, x, y);
+        x += (str[0] != '.') ? font.width : ((font.width / 2) + 1);
+        str++;
+    }
+}
+
+static void frame_draw_image(const unsigned char *image_data, size_t length, int x, int y)
+{
+    int height = (length == 1545) ? 103 : 40,
+        width = (length == 1545) ? 120 : 48;
+    for (int i = 0; i < height; i++)
+    {
+        for (int j = 0; j < (width / 8); j++)
+        {
+            uint8_t byte = image_data[i * (width / 8) + j];
+            frame_draw_byte(x + (j * 8), y + i, byte);
+        }
+    }
+}
+
+/* Used to draw degree symbol, unecessary, but I wanted to implement the midpoint circle algorithm */
+static void frame_draw_circle(int center_x, int center_y, int radius)
+{
+    /* Midpoint circle algorithm */
+    int x = radius;
+    int y = 0;
+    int decision_over_2 = 1 - x; // Decision criterion divided by 2 evaluated at x=r, y=0
+
+    while (y <= x)
+    {
+        frame_draw_byte(center_x + x, center_y + y, 0x03);
+        frame_draw_byte(center_x + y, center_y + x, 0x03);
+        frame_draw_byte(center_x - x, center_y + y, 0x03);
+        frame_draw_byte(center_x - y, center_y + x, 0x03);
+        frame_draw_byte(center_x - x, center_y - y, 0x03);
+        frame_draw_byte(center_x - y, center_y - x, 0x03);
+        frame_draw_byte(center_x + x, center_y - y, 0x03);
+        frame_draw_byte(center_x + y, center_y - x, 0x03);
+        y++;
+        if (decision_over_2 <= 0)
+        {
+            decision_over_2 += 2 * y + 1; // Change in decision criterion for y -> y+1
+        }
+        else
+        {
+            x--;
+            decision_over_2 += 2 * (y - x) + 1; // Change for y -> y+1 and x -> x-1
+        }
+    }
+}
+
+static char *float_to_string(float value)
+{
+    static char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%.1f", value);
+    return buffer;
+}
+
 void app_main()
 {
+    /* Default log level is set to ERROR to speed up boot time, set it back to INFO */
+    esp_log_level_set("*", ESP_LOG_INFO);
     /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -610,6 +716,7 @@ void app_main()
 
     //https_get_task();
 
+    // TODO: Eventually these need to be initialize as RTC GPIOs so they can be used by the ULP in deep sleep
     /* CS pin being held low is what tells the display to listen for data,
      * so set it high when not sending data */
     gpio_reset_pin(CS_PIN);
@@ -637,17 +744,38 @@ void app_main()
     gpio_set_level(SCK_PIN, LOW);
 
     epd_init();
-    frame_draw_char(font16, 'H', 11, 10);
-    frame_draw_char(font16, 'E', 22, 10);
-    frame_draw_char(font16, 'L', 33, 10);
-    frame_draw_char(font16, 'L', 44, 10);
-    frame_draw_char(font16, 'O', 55, 10);
-    frame_draw_char(font16, ' ', 66, 10);
-    frame_draw_char(font16, 'W', 77, 10);
-    frame_draw_char(font16, 'O', 88, 10);
-    frame_draw_char(font16, 'R', 99, 10);
-    frame_draw_char(font16, 'L', 110, 10);
-    frame_draw_char(font16, 'D', 121, 10);
+
+    frame_draw_image(icon_thunder, sizeof(icon_thunder), 20, 20);
+    frame_draw_string(font20, "Currently, ", 10, 130);
+    frame_draw_string(font40, "76.4", 30, 160);
+    frame_draw_circle((28 + (font40.width * 4) - (font40.width / 2)), 165, 5);
+    frame_draw_string(font20, "feels like", 140, 180);
+    frame_draw_string(font24, "74.2", 290, 176);
+    frame_draw_circle((290 + (font24.width * 4) - (font24.width / 2)), 176, 3);
+    frame_draw_string(font24, "High: ", 175, 20);
+    frame_draw_string(font24, "80.1", 260, 20);
+    frame_draw_circle((260 + (font20.width * 4) - (font20.width / 2)), 20, 3);
+    frame_draw_string(font24, "Low: ", 175, 50);
+    frame_draw_string(font24, "65.2", 260, 50);
+    frame_draw_circle((260 + (font20.width * 4) - (font20.width / 2)), 50, 3);
+    frame_draw_string(font16, "Wind", 175, 80);
+    frame_draw_string(font16, "Speed", 175, 95);
+    frame_draw_image(icon_wind, sizeof(icon_wind), 235, 75);
+    frame_draw_string(font24, "9.6", 290, 85);
+    frame_draw_string(font20, "mph", (290 + (font24.width * 3) - (font24.width / 2)), 85);
+    frame_draw_string(font16, "Cloud", 175, 125);
+    frame_draw_string(font16, "Cover", 175, 140);
+    frame_draw_image(icon_cloud_small, sizeof(icon_cloud_small), 240, 120);
+    frame_draw_string(font24, "45", 295, 130);
+    frame_draw_string(font20, "%", (285 + (font24.width * 3) - (font24.width / 2)), 125);
+
+    frame_draw_giant_char(ONE, 400, 20);
+    frame_draw_giant_char(TWO, 450, 20);
+    frame_draw_giant_char(COLON, 500, 20);
+    frame_draw_giant_char(THREE, 550, 20);
+    frame_draw_giant_char(FOUR, 600, 20);
+    frame_draw_giant_char(LETTER_P, 650, 20);
+    frame_draw_giant_char(LETTER_M, 700, 20);
+
     epd_write_frame();
-    epd_sleep();
 }
