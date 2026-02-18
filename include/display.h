@@ -21,14 +21,17 @@
 #define DISPLAY_REFRESH     0x12
 #define POWER_OFF           0x02
 #define DEEP_SLEEP          0x07
+#define PARTIAL_WINDOW      0x90
+#define PARTIAL_IN          0x91
+#define PARTIAL_OUT         0x92
 
 /* GPIO Pin mappings */
-#define MOSI_PIN    23
-#define SCK_PIN     18
-#define CS_PIN      2
-#define DC_PIN      0
-#define RST_PIN     13
-#define BUSY_PIN    14
+#define MOSI_PIN    25  // 6
+#define SCK_PIN     26  // 7
+#define CS_PIN      2   // 12
+#define DC_PIN      0   // 11
+#define RST_PIN     13  // 14
+#define BUSY_PIN    14  // 16
 
 /* GPIO Pin states */
 #define HIGH    1
