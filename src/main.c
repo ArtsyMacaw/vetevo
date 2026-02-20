@@ -64,7 +64,7 @@ static struct weather_today
 #define FORECAST_DAYS 5
 static struct weather_forecast
 {
-    uint16_t id; // Weather condition code that corresponds to an icon
+    uint16_t id;
     char description[32];
     float high_temp;
     float low_temp;
@@ -608,11 +608,11 @@ static void frame_draw_char(font_t font, char c, int x, int y)
     /* Subtract the first character in the font from the character to get the index,
      * then multiply by the number of bytes per character to get the offset in the font data array */
     uint32_t offset = (c - ' ') * font.height * bytes_per_char;
-    const unsigned char *char_start = font.table + offset;
+    const uint8_t *char_start = font.table + offset;
 
     /* Convert the 1D font data array for the character into a 2D array
      * for easier indexing when drawing to the frame buffer. */
-    unsigned char char_2d[font.height][bytes_per_char];
+    uint8_t char_2d[font.height][bytes_per_char];
     memcpy(char_2d, char_start, sizeof(char_2d));
 
     for (int i = 0; i < font.height; i++)
@@ -627,7 +627,7 @@ static void frame_draw_char(font_t font, char c, int x, int y)
 static void frame_draw_giant_char(uint32_t offset, int x, int y)
 {
     uint32_t bytes_per_char = font60.width / 8 + (font60.width % 8 != 0);
-    const unsigned char *char_start = font60.table + offset;
+    const uint8_t *char_start = font60.table + offset;
 
     for (int i = 0; i < font60.height; i++)
     {
@@ -650,7 +650,7 @@ static void frame_draw_string(font_t font, const char *str, int x, int y)
     }
 }
 
-static void frame_draw_image(const unsigned char *image_data, size_t length, int x, int y)
+static void frame_draw_image(const uint8_t *image_data, size_t length, int x, int y)
 {
     int height = (length == 1545) ? 103 : 40,
         width = (length == 1545) ? 120 : 48;

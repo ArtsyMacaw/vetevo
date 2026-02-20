@@ -1,12 +1,7 @@
 #ifndef DISPLAY_H
 #define DISPLAY_H
 
-/* Type definitions for display data */
-#define UBYTE uint8_t
-#define UWORD uint16_t
-#define UDOUBLE uint32_t
-
-/* Magic numbers for display commands in order of use in startup */
+/* Magic numbers for display commands */
 #define POWER_SETTING       0x01
 #define BOOSTER_SOFT_START  0x06
 #define POWER_ON            0x04
@@ -26,12 +21,12 @@
 #define PARTIAL_OUT         0x92
 
 /* GPIO Pin mappings */
-#define MOSI_PIN    15  // 6
-#define SCK_PIN     17  // 7
-#define CS_PIN      3   // 12
-#define DC_PIN      4   // 11
-#define RST_PIN     9  // 14
-#define BUSY_PIN    18  // 16
+#define MOSI_PIN    15
+#define SCK_PIN     17
+#define CS_PIN      3
+#define DC_PIN      4
+#define RST_PIN     9
+#define BUSY_PIN    18
 #define PWR_PIN     7
 
 /* GPIO Pin states */
@@ -41,7 +36,5 @@
 /* Display dimensions */
 #define EPD_WIDTH 800
 #define EPD_HEIGHT 480
-
-extern unsigned char background[];
 
 #endif

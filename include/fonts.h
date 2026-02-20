@@ -1,3 +1,5 @@
+#include <stdint.h>
+
 #ifndef FONTS_H
 #define FONTS_H
 
@@ -5,7 +7,7 @@
 typedef struct {
     int width;
     int height;
-    const unsigned char *table;
+    const uint8_t *table;
 } font_t;
 
 extern font_t font16;

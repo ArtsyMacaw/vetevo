@@ -3,7 +3,7 @@
 /* Generated with waveshares Zimo221 tool */
 
 /* Font data for Courier New 16pt */
-const unsigned char font16_table[] =
+const uint8_t font16_table[] =
 {
 	// @0 ' ' (11 pixels wide)
 	0x00, 0x00, //            
@@ -1724,7 +1724,7 @@ font_t font16 =
 };
 
 // Character bitmaps for Courier New 15pt
-const unsigned char Font20_Table[] = 
+const uint8_t Font20_Table[] = 
 {
 	// @0 ' ' (14 pixels wide)
 	0x00, 0x00, //               
@@ -3825,7 +3825,7 @@ font_t font20 =
     Font20_Table,
 };
 
-const unsigned char Font24_Table [] = 
+const uint8_t Font24_Table [] = 
 {
 	// @0 ' ' (17 pixels wide)
 	0x00, 0x00, 0x00, //                  
@@ -6305,7 +6305,7 @@ font_t font24 =
     Font24_Table
 };
 
-const unsigned char Font40_Table [] = 
+const uint8_t Font40_Table [] = 
 {
 	// ASCII: 32 " " (24 pixels wide)
 	0x00, 0x00, 0x00, 
@@ -10304,7 +10304,7 @@ font_t font40 = {
 	Font40_Table
 };
 
-const unsigned char font60_table[] =
+const uint8_t font60_table[] =
 {
     // '1' @0
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
