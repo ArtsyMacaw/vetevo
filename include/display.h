@@ -26,12 +26,13 @@
 #define PARTIAL_OUT         0x92
 
 /* GPIO Pin mappings */
-#define MOSI_PIN    25  // 6
-#define SCK_PIN     26  // 7
-#define CS_PIN      2   // 12
-#define DC_PIN      0   // 11
-#define RST_PIN     13  // 14
-#define BUSY_PIN    14  // 16
+#define MOSI_PIN    15  // 6
+#define SCK_PIN     17  // 7
+#define CS_PIN      3   // 12
+#define DC_PIN      4   // 11
+#define RST_PIN     9  // 14
+#define BUSY_PIN    18  // 16
+#define PWR_PIN     7
 
 /* GPIO Pin states */
 #define HIGH    1
