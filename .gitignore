@@ -2,3 +2,4 @@
 secret.h
 *.vcxproj*
 sdkconfig*
+logs
