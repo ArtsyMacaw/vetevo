@@ -27,14 +27,13 @@
 #define DC_PIN      4
 #define RST_PIN     9
 #define BUSY_PIN    18
-#define PWR_PIN     7
 
 /* GPIO Pin states */
 #define HIGH    1
 #define LOW     0
 
 /* Display dimensions */
-#define EPD_WIDTH 800
+#define EPD_WIDTH  800
 #define EPD_HEIGHT 480
 
 #endif
