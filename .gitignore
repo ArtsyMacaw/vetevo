@@ -2,4 +2,5 @@
 secret.h
 *.vcxproj*
 sdkconfig*
+!sdkconfig.defaults
 logs
