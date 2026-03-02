@@ -1,6 +1,9 @@
 #include "ulp_riscv.h"
 #include "ulp_riscv_gpio.h"
 #include "ulp_riscv_utils.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc.h"
+#include "../include/display.h"
 
 /* ULP has 8KB of memory for the code, data, and stack combined, so size is paramount
  * Current size breakdown:
@@ -11,12 +14,15 @@
  * - Leftover for stack and variables: ~1.7KB
  */
 
-#define HIGH      1
-#define LOW       0
+#define CHAR_SIZE      510
+#define CHAR_HEIGHT    85
+#define CHAR_WIDTH     48
+#define NUM_CHARS      5
+#define BITS_PER_BYTE  8
 
 static const uint8_t font60_table[]; // MSB is the pixel value, lower 7 bits are the run length
-static uint8_t time[85][(48 * 5) / 8];
-static uint8_t dst[510];
+static uint8_t time[CHAR_HEIGHT][(CHAR_WIDTH * NUM_CHARS) / BITS_PER_BYTE];
+static uint8_t dst[CHAR_SIZE];
 
 /* Offsets */
 enum {
@@ -52,6 +58,9 @@ enum {
 volatile uint32_t hours     = 0;
 volatile uint32_t minutes   = 0;
 
+/* RTC calibration value calculated by the main CPU */
+volatile uint32_t clk_cal = 0;
+
 /* Global debug variables to track the state of the ULP program from the main CPU */
 volatile uint32_t wakeups        = 0;
 volatile uint32_t launched       = 0;
@@ -61,6 +70,8 @@ volatile uint32_t epd_started    = 0;
 volatile uint32_t chars_drawn    = 0;
 volatile uint32_t frame_drawn    = 0;
 volatile uint32_t epd_reset_done = 0;
+volatile uint32_t sleep_cycles   = 0;
+volatile uint32_t drift_cycles   = 0;
 
 /* Decompress the RLE compressed font table */
 void rle_decompress(const uint8_t *src, size_t src_size, size_t bit_count)
@@ -86,38 +97,38 @@ void rle_decompress(const uint8_t *src, size_t src_size, size_t bit_count)
 
 static void spi_write_byte(uint8_t byte)
 {
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < BITS_PER_BYTE; i++)
     {
-        ulp_riscv_gpio_output_level(GPIO_NUM_15, (byte & 0x80) ? HIGH : LOW);
+        ulp_riscv_gpio_output_level(MOSI_PIN, (byte & 0x80) ? HIGH : LOW);
         byte <<= 1;
-        ulp_riscv_gpio_output_level(GPIO_NUM_17, HIGH);
-        ulp_riscv_gpio_output_level(GPIO_NUM_17, LOW);
+        ulp_riscv_gpio_output_level(SCK_PIN, HIGH);
+        ulp_riscv_gpio_output_level(SCK_PIN, LOW);
     }
+    ulp_riscv_gpio_output_level(CS_PIN, HIGH);
     bytes_written++;
-    ulp_riscv_gpio_output_level(GPIO_NUM_3, HIGH);
 }
 
 static void spi_write_command(uint8_t command)
 {
-    ulp_riscv_gpio_output_level(GPIO_NUM_4, LOW);
-    ulp_riscv_gpio_output_level(GPIO_NUM_3, LOW);
+    ulp_riscv_gpio_output_level(DC_PIN, LOW);
+    ulp_riscv_gpio_output_level(CS_PIN, LOW);
     spi_write_byte(command);
 }
 
 static void spi_write_data(uint8_t data)
 {
-    ulp_riscv_gpio_output_level(GPIO_NUM_4, HIGH);
-    ulp_riscv_gpio_output_level(GPIO_NUM_3, LOW);
+    ulp_riscv_gpio_output_level(DC_PIN, HIGH);
+    ulp_riscv_gpio_output_level(CS_PIN, LOW);
     spi_write_byte(data);
 }
 
 static void epd_reset()
 {
-    ulp_riscv_gpio_output_level(GPIO_NUM_9, HIGH);
+    ulp_riscv_gpio_output_level(RST_PIN, HIGH);
     ulp_riscv_delay_cycles(20 * ULP_RISCV_CYCLES_PER_MS);
-    ulp_riscv_gpio_output_level(GPIO_NUM_9, LOW);
+    ulp_riscv_gpio_output_level(RST_PIN, LOW);
     ulp_riscv_delay_cycles(20 * ULP_RISCV_CYCLES_PER_MS);
-    ulp_riscv_gpio_output_level(GPIO_NUM_9, HIGH);
+    ulp_riscv_gpio_output_level(RST_PIN, HIGH);
     ulp_riscv_delay_cycles(20 * ULP_RISCV_CYCLES_PER_MS);
     epd_reset_done = 1;
 }
@@ -125,7 +136,7 @@ static void epd_reset()
 static void epd_wait_until_idle()
 {
     wait_flag = 1;
-    while (ulp_riscv_gpio_get_level(GPIO_NUM_18) == HIGH)
+    while (ulp_riscv_gpio_get_level(BUSY_PIN) == LOW)
     {
         ulp_riscv_delay_cycles(10 * ULP_RISCV_CYCLES_PER_MS);
     }
@@ -136,62 +147,62 @@ static void epd_init()
 {
     epd_reset();
 
-    spi_write_command(0x06);
+    spi_write_command(BOOSTER_SOFT_START);
     spi_write_data(0x17);
     spi_write_data(0x17);
     spi_write_data(0x27);
     spi_write_data(0x17);
 
-    spi_write_command(0x01);
+    spi_write_command(POWER_SETTING);
     spi_write_data(0x07);
     spi_write_data(0x17);
     spi_write_data(0x3f);
     spi_write_data(0x3f);
 
-    spi_write_command(0x04);
+    spi_write_command(POWER_ON);
     epd_wait_until_idle();
 
-    spi_write_command(0x00);
+    spi_write_command(PANEL_SETTING);
     spi_write_data(0x1f);
 
-    spi_write_command(0x61);
+    spi_write_command(RESOLUTION_SETTING);
     spi_write_data(0x03);
     spi_write_data(0x20);
     spi_write_data(0x01);
     spi_write_data(0xe0);
 
-    spi_write_command(0x15);
+    spi_write_command(DUAL_SPI);
     spi_write_data(0x00);
 
-    spi_write_command(0x60);
+    spi_write_command(TCON_SETTING);
     spi_write_data(0x22);
 
-    spi_write_command(0x50);
+    spi_write_command(VCOM_DATA_INTERVAL);
     spi_write_data(0x10);
     spi_write_data(0x07);
     epd_started = 1;
 }
 
 // TODO: Add epd_fast_init that changes setting to fast refresh
+static void epd_sleep()
+{
+    spi_write_command(POWER_OFF);
+    spi_write_command(DEEP_SLEEP);
+    spi_write_data(0xA5);
+}
 
 /* Needs to be done every 10 partial updates to prevent ghosting */
 static void epd_full_refresh()
 {
     epd_wait_until_idle();
-    spi_write_command(0x12);
-}
-
-static void epd_sleep()
-{
-    spi_write_command(0x02);
-    spi_write_command(0x07);
-    spi_write_data(0xA5);
+    spi_write_command(DISPLAY_REFRESH);
+    epd_sleep();
 }
 
 static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     epd_wait_until_idle();
-    spi_write_command(0x90);
+    spi_write_command(PARTIAL_WINDOW);
     spi_write_data(x / 256);
     spi_write_data(x % 256);
     spi_write_data((x + w - 1) / 256);
@@ -202,8 +213,8 @@ static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     spi_write_data((y + h - 1) % 256);
     spi_write_data(0x00);
 
-    spi_write_command(0x91);
-    spi_write_command(0x13);
+    spi_write_command(PARTIAL_IN);
+    spi_write_command(TRANSFER_DATA_2);
     for (int i = 0; i < h; i++)
     {
         for (int j = 0; j < (w / 8); j++)
@@ -211,8 +222,8 @@ static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
             spi_write_data(time[i][j]);
         }
     }
-    spi_write_command(0x12);
-    spi_write_command(0x92);
+    spi_write_command(DISPLAY_REFRESH);
+    spi_write_command(PARTIAL_OUT);
     epd_wait_until_idle();
     frame_drawn++;
 }
@@ -220,16 +231,16 @@ static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 static void frame_draw_giant_char(uint32_t offset, uint32_t rle_size, uint8_t place)
 {
     const uint8_t *char_start = font60_table + offset;
-    rle_decompress(char_start, rle_size, 4010);
-    uint8_t x = (place * 48) / 8;
-    for (int i = 0; i < 85; i++)
+    rle_decompress(char_start, rle_size, (CHAR_SIZE * BITS_PER_BYTE));
+    uint8_t x = (place * CHAR_WIDTH) / BITS_PER_BYTE;
+    for (int i = 0; i < CHAR_HEIGHT; i++)
     {
-        for (int j = 0; j < 6; j++)
+        for (int j = 0; j < (CHAR_WIDTH / BITS_PER_BYTE); j++)
         {
-            time[i][x + j] = dst[j + (i * 6)];
+            time[i][x + j] = dst[j + (i * (CHAR_WIDTH / BITS_PER_BYTE))];
         }
     }
-    for (int i = 0; i < 510; i++)
+    for (int i = 0; i < CHAR_SIZE; i++)
     {
         dst[i] = 0;
     }
@@ -238,7 +249,8 @@ static void frame_draw_giant_char(uint32_t offset, uint32_t rle_size, uint8_t pl
 
 static void frame_draw_time()
 {
-    uint8_t time[] = {
+    uint8_t time[] =
+    {
         (hours / 10) % 10,
         hours % 10,
         10, // :
@@ -267,6 +279,19 @@ static void frame_draw_time()
     }
 }
 
+static uint64_t time_get()
+{
+    REG_SET_BIT(RTC_CNTL_TIME_UPDATE_REG, RTC_CNTL_TIME_UPDATE);
+    while (REG_GET_BIT(RTC_CNTL_TIME_UPDATE_REG, RTC_CNTL_TIME_UPDATE))
+    {
+        // Empty
+    }
+    uint32_t low = REG_READ(RTC_CNTL_TIME0_REG);
+    uint32_t high = REG_READ(RTC_CNTL_TIME1_REG);
+
+    return ((uint64_t)high << 32) | (uint64_t) low;
+}
+
 int main()
 {
     wakeups++;
@@ -276,10 +301,9 @@ int main()
         ulp_riscv_timer_stop();
         return 0;
     }
-#if PROFILE
-    ulp_riscv_gpio_output_level(GPIO_NUM_8, HIGH);
-#endif
+
     launched = 1;
+    uint64_t start_time = time_get();
 
     frame_draw_time();
     minutes = (minutes + 1) % 60; // Increment minutes every wakeup, and roll over to hours after 60
@@ -288,19 +312,28 @@ int main()
 
     epd_init();
     // TODO: Passing old time frame buffer may help with ghosting? Unclear need to confirm
-    epd_write_partial(432, 100, (48 * 5), 85);
+    epd_write_partial(CLOCK_X, CLOCK_Y, (CHAR_WIDTH * NUM_CHARS), CHAR_HEIGHT);
 
-    // FIXME: This does not work for some reason; I think the display isn't holding the BUSY pin high
-    // while refreshing, manually waiting may be needed
-    if ((wakeups % 10) == 0)
+    if ((wakeups % 10) == 1)
     {
         epd_full_refresh();
+    } else {
+        epd_sleep();
     }
 
-    epd_sleep();
-#if PROFILE
-    ulp_riscv_gpio_output_level(GPIO_NUM_8, LOW);
-#endif
+    /* Calculate execution time and adjust timer to ensure wakeup occurs at the start of every minute */
+    uint64_t end_time = time_get();
+    uint64_t elapsed_cycles = end_time - start_time;
+    uint64_t target_cycles = ((((60 * 1000 * 1000)+ 1) / clk_cal) << RTC_CLK_CAL_FRACT)
+        + ((((60 * 1000 * 1000) + 1) % clk_cal) << RTC_CLK_CAL_FRACT) / clk_cal; // 60 seconds
+    sleep_cycles = (uint32_t)(target_cycles - elapsed_cycles);
+    sleep_cycles += drift_cycles;
+    REG_SET_FIELD(RTC_CNTL_ULP_CP_TIMER_1_REG, RTC_CNTL_ULP_CP_TIMER_SLP_CYCLE, sleep_cycles);
+
+    if ((wakeups % 10) == 1)
+    {
+        ulp_riscv_delay_cycles(6000 * ULP_RISCV_CYCLES_PER_MS);
+    }
 }
 
 static const uint8_t font60_table[] =

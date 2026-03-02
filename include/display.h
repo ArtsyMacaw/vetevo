@@ -21,12 +21,12 @@
 #define PARTIAL_OUT         0x92
 
 /* GPIO Pin mappings */
-#define MOSI_PIN    15
-#define SCK_PIN     17
-#define CS_PIN      3
-#define DC_PIN      4
-#define RST_PIN     9
-#define BUSY_PIN    18
+#define MOSI_PIN    GPIO_NUM_15
+#define SCK_PIN     GPIO_NUM_17
+#define CS_PIN      GPIO_NUM_3
+#define DC_PIN      GPIO_NUM_4
+#define RST_PIN     GPIO_NUM_9
+#define BUSY_PIN    GPIO_NUM_18
 
 /* GPIO Pin states */
 #define HIGH    1
@@ -35,5 +35,9 @@
 /* Display dimensions */
 #define EPD_WIDTH  800
 #define EPD_HEIGHT 480
+
+/* Clock coordinates for display */
+#define CLOCK_X 432
+#define CLOCK_Y 100
 
 #endif
