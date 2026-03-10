@@ -5,8 +5,8 @@
 
 /* Fonts are ASCII encoded to allow for easier character lookup */
 typedef struct {
-    int width;
-    int height;
+    const int width;
+    const int height;
     const uint8_t *table;
 } font_t;
 
