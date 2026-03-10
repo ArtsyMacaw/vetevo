@@ -35,10 +35,16 @@
  * - frame_draw_byte: called by all frame drawing functions */
 
 // TODO: use espidf heap tracing to check for memory leaks
+// TODO: go through and correctly handle all the ESP_ERROR_CHECKS
 
+/* Wall clock time */
+static time_t now;
+static struct tm timeinfo;
+#define UPDATE_TIME time(&now); localtime_r(&now, &timeinfo)
+
+/* Wifi definitions and variables */
 static EventGroupHandle_t wifi_event_group;
 static int retry_num = 0;
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 #define MAX_RETRY_NUM      5
@@ -50,6 +56,15 @@ extern const uint8_t server_cert_pem_end[]   asm("_binary_openweather_pem_end");
 /* ULP binary embedded by CMake */
 extern const uint8_t bin_start[] asm("_binary_ulp_main_bin_start");
 extern const uint8_t bin_end[]   asm("_binary_ulp_main_bin_end");
+
+/* Weather id definitions */
+#define THUNDERSTORM_START  200
+#define DRIZZLE_START       300
+#define RAIN_START          500
+#define SNOW_START          600
+#define ATMOSPHERE_START    700
+#define CLEAR_SKY           800
+#define CLOUDS_START        801
 
 /* Current weather conditions doesn't store all returned data from API
  * just those that are displayed */
@@ -67,7 +82,12 @@ static struct weather_today
     float cloudiness; // % of sky covered by clouds
 } weather;
 
-// TODO: Switch to using hourly forecast API
+#define HOURLY_FORECASTS 12
+static struct hourly_forecast
+{
+    float temp;
+    float feels_like_temp;
+} hourly_forecast[HOURLY_FORECASTS];
 
 #define FORECAST_DAYS 5
 static struct weather_forecast
@@ -81,7 +101,7 @@ static struct weather_forecast
     float cloudiness;
 } forecast[FORECAST_DAYS];
 
-static uint8_t frame[EPD_HEIGHT][EPD_WIDTH / 8]; // Each byte represents 8 pixels, so width is divided by 8
+static uint8_t frame[EPD_HEIGHT][EPD_BYTE_WIDTH];
 
 // TODO: Check esp_err_t return value
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -143,7 +163,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-static void wifi_init_sta()
+static esp_netif_t *wifi_start()
 {
     // TODO: If ESP_ERROR returns an error restart the board and try again.
     // preferably the ULP should continue to update the time on the display
@@ -153,7 +173,7 @@ static void wifi_init_sta()
 
     /* Create Network Interface */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *wifi = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_init(&cfg));
@@ -181,6 +201,7 @@ static void wifi_init_sta()
     };
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
     /* Start Wi-Fi */
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
     ESP_LOGI("wifi", "Wi-Fi initialization completed.");
@@ -203,11 +224,18 @@ static void wifi_init_sta()
     } else {
         ESP_LOGE("wifi", "UNEXPECTED EVENT");
     }
+
+    return wifi;
 }
 
-//TODO: Create wifi cleanup function that destroys everything
+static void wifi_stop(esp_netif_t *netif)
+{
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_deinit());
+    esp_netif_destroy_default_wifi(netif);
+}
 
-static void https_get_task()
+static void https_get_weather()
 {
     esp_http_client_config_t config =
     {
@@ -310,14 +338,20 @@ static void https_get_task()
             weather.wind_speed = wind_speed->valuedouble;
             ESP_LOGI("weather", "Wind Speed: %.2f mph", weather.wind_speed);
         }
+        cJSON *wind_direction = cJSON_GetObjectItem(wind, "deg");
+        if (cJSON_IsNumber(wind_direction))
+        {
+            weather.wind_direction_degrees = wind_direction->valueint;
+            ESP_LOGI("weather", "Wind Direction: %d degrees", weather.wind_direction_degrees);
+        }
 
         cJSON *clouds = cJSON_GetObjectItem(json, "clouds");
         assert(cJSON_IsObject(clouds));
         cJSON *cloudiness = cJSON_GetObjectItem(clouds, "all");
         if (cJSON_IsNumber(cloudiness))
         {
-            weather.cloudiness = cloudiness->valueint;
-            ESP_LOGI("weather", "Cloudiness: %d%%", weather.cloudiness);
+            weather.cloudiness = cloudiness->valuedouble;
+            ESP_LOGI("weather", "Cloudiness: %.2f%%", weather.cloudiness);
         }
 
         /* Won't return anything if it hasn't rained in the last hour */
@@ -357,9 +391,7 @@ static void https_get_task()
     {
         buffer[read_len] = '\0';
         ESP_LOGV("http", "Received data: %s", buffer);
-    }
-    else
-    {
+    } else {
         ESP_LOGE("http", "Failed to read response");
     }
 
@@ -442,9 +474,7 @@ static void https_get_task()
 
 static void sync_sntp_time()
 {
-    /* RTC clock can drift substantially, so sync it needs to be synced with an NTP server periodically */
-    time_t now = 0;
-    struct tm timeinfo = { 0 };
+    /* Configure SNTP to use the NTP pool server and synchronize time */
     esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_netif_sntp_init(&sntp_config);
 
@@ -458,15 +488,16 @@ static void sync_sntp_time()
     } else {
         ESP_LOGI("sntp", "Time synchronized successfully");
     }
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    ESP_LOGI("sntp", "Current time: %s", asctime(&timeinfo));
+    UPDATE_TIME;
+    char timeinfo_str[64];
+    strftime(timeinfo_str, sizeof(timeinfo_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI("sntp", "Current time: %s", timeinfo_str);
     esp_netif_sntp_deinit();
 }
 
 static void IRAM_ATTR spi_write_byte(uint8_t byte)
 {
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < BITS_PER_BYTE; i++)
     {
         rtc_gpio_set_level(MOSI_PIN, (byte & 0x80) ? HIGH : LOW); // 0x80 = 10000000 BITMASK
         byte <<= 1;
@@ -515,8 +546,7 @@ static void epd_init()
      * was used as a reference for the initialization sequence and commands */
     epd_reset();
 
-    /* Currently all settings are left at their defaults
-     * because I have no idea what they do */
+    /* Default from datasheet unless otherwise specified */
     spi_write_command(BOOSTER_SOFT_START);
     spi_write_data(0x17);
     spi_write_data(0x17);
@@ -547,16 +577,25 @@ static void epd_init()
     spi_write_command(TCON_SETTING);
     spi_write_data(0x22);
 
+    /* Altered from default to transfer data from NEW to OLD automatically */
     spi_write_command(VCOM_DATA_INTERVAL);
-    spi_write_data(0x10);
+    spi_write_data(0x18);
     spi_write_data(0x07);
+
+    /* Enable fast refresh */
+    spi_write_command(CASCADE_SETTING);
+    spi_write_data(0x02);
+    spi_write_command(FORCE_TEMPERATURE);
+    spi_write_data(0x5a);
+
+    ESP_LOGI("epd", "Initialization complete");
 }
 
 static void epd_clear()
 {
     epd_wait_until_idle();
     spi_write_command(TRANSFER_DATA_2);
-    for (unsigned long i = 0; i < ((EPD_HEIGHT * EPD_WIDTH) / 8); i++)
+    for (size_t i = 0; i < (EPD_HEIGHT * EPD_BYTE_WIDTH); i++)
     {
         spi_write_data(0x00);
     }
@@ -567,11 +606,10 @@ static void epd_clear()
 static void epd_write_frame()
 {
     epd_wait_until_idle();
-    /* The display is black and white so each byte represents 8 pixels, with 0s being black and 1s being white. */
     spi_write_command(TRANSFER_DATA_2);
-    for (unsigned long i = 0; i < EPD_HEIGHT; i++)
+    for (size_t i = 0; i < EPD_HEIGHT; i++)
     {
-        for (unsigned long j = 0; j < EPD_WIDTH / 8; j++)
+        for (size_t j = 0; j < EPD_BYTE_WIDTH; j++)
         {
             spi_write_data(frame[i][j]);
         }
@@ -586,8 +624,16 @@ static void epd_sleep()
 {
     spi_write_command(POWER_OFF);
     epd_wait_until_idle();
-    spi_write_command(DEEP_SLEEP);
-    spi_write_data(0xA5); // Confirmation byte
+}
+
+static void frame_draw_pixel(int x, int y)
+{
+    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT)
+    {
+        ESP_LOGE("frame", "Pixel position out of bounds: x=%d, y=%d", x, y);
+        return;
+    }
+    frame[y][x / BITS_PER_BYTE] |= (0x80 >> (x % BITS_PER_BYTE));
 }
 
 static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
@@ -599,18 +645,18 @@ static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
     }
     /* Shift the byte to align with the correct bits in the frame buffer, then OR it with the existing byte
      * to preserve any pixels that have already been drawn in that byte. */
-    frame[y][x / 8] |= byte >> (x % 8);
+    frame[y][x / BITS_PER_BYTE] |= byte >> (x % BITS_PER_BYTE);
     /* If the byte being drawn isn't aligned to a byte boundary, then
      * the byte next to it also needs to be updated with the remaining bits. */
-    if ((x % 8) != 0 && (x / 8 + 1) < (EPD_WIDTH / 8))
+    if ((x % BITS_PER_BYTE) != 0 && (x / BITS_PER_BYTE + 1) < EPD_BYTE_WIDTH)
     {
-        frame[y][x / 8 + 1] |= byte << (8 - (x % 8));
+        frame[y][x / BITS_PER_BYTE + 1] |= byte << (BITS_PER_BYTE - (x % BITS_PER_BYTE));
     }
 }
 
 static void frame_draw_char(font_t font, char c, int x, int y)
 {
-    uint8_t bytes_per_char = font.width / 8 + (font.width % 8 != 0); // Calculate bytes per character in font data
+    uint8_t bytes_per_char = font.width / BITS_PER_BYTE + (font.width % BITS_PER_BYTE != 0);
 
     /* Subtract the first character in the font from the character to get the index,
      * then multiply by the number of bytes per character to get the offset in the font data array */
@@ -626,21 +672,21 @@ static void frame_draw_char(font_t font, char c, int x, int y)
     {
         for (int j = 0; j < bytes_per_char; j++)
         {
-            frame_draw_byte((x + (j * 8)), (y + i), char_2d[i][j]);
+            frame_draw_byte((x + (j * BITS_PER_BYTE)), (y + i), char_2d[i][j]);
         }
     }
 }
 
 static void frame_draw_giant_char(uint32_t offset, int x, int y)
 {
-    uint8_t bytes_per_char = font60.width / 8 + (font60.width % 8 != 0);
+    uint8_t bytes_per_char = font60.width / BITS_PER_BYTE + (font60.width % BITS_PER_BYTE != 0);
     const uint8_t *char_start = font60.table + offset;
 
     for (int i = 0; i < font60.height; i++)
     {
         for (int j = 0; j < bytes_per_char; j++)
         {
-            frame_draw_byte((x + (j * 8)), (y + i), char_start[i * bytes_per_char + j]);
+            frame_draw_byte((x + (j * BITS_PER_BYTE)), (y + i), char_start[i * bytes_per_char + j]);
         }
     }
 }
@@ -663,10 +709,10 @@ static void frame_draw_image(const uint8_t *image_data, size_t length, int x, in
         width = (length == 1545) ? 120 : 48;
     for (int i = 0; i < height; i++)
     {
-        for (int j = 0; j < (width / 8); j++)
+        for (int j = 0; j < (width / BITS_PER_BYTE); j++)
         {
-            uint8_t byte = image_data[i * (width / 8) + j];
-            frame_draw_byte(x + (j * 8), y + i, byte);
+            uint8_t byte = image_data[i * (width / BITS_PER_BYTE) + j];
+            frame_draw_byte(x + (j * BITS_PER_BYTE), y + i, byte);
         }
     }
 }
@@ -690,13 +736,8 @@ static void frame_draw_circle(int center_x, int center_y, int radius)
         frame_draw_byte(center_x + x, center_y - y, 0x03);
         frame_draw_byte(center_x + y, center_y - x, 0x03);
         y++;
-        if (decision_over_2 <= 0)
-        {
-            decision_over_2 += 2 * y + 1; // Change in decision criterion for y -> y+1
-        } else {
-            x--;
-            decision_over_2 += 2 * (y - x) + 1; // Change for y -> y+1 and x -> x-1
-        }
+        if (decision_over_2 <= 0) { decision_over_2 += 2 * y + 1; }
+        else                      { x--; decision_over_2 += 2 * (y - x) + 1; }
     }
 }
 
@@ -704,51 +745,119 @@ static void frame_draw_circle(int center_x, int center_y, int radius)
 static void frame_draw_line(int x0, int y0, int x1, int y1)
 {
     int dx = abs(x1 - x0),
-        sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0),
-        sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy, e2; // error value e_xy
+        sx = (x0 < x1) ? 1 : -1,
+        dy = -abs(y1 - y0),
+        sy = (y0 < y1) ? 1 : -1,
+        err = dx + dy,
+        e2; // error value e_xy
     while (1)
     {
         frame_draw_byte(x0, y0, 0x03);
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
-        if (e2 >= dy)
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* Draws a rectangle with an x in the middle of it */
+static void frame_draw_x_rectangle(int x0, int y0, int x1, int y1)
+{
+    for (int x = x0; x <= x1; x++)
+    {
+        frame_draw_byte(x, y0, 0x03);
+        frame_draw_byte(x, y1, 0x03);
+    }
+    for (int y = y0; y <= y1; y++)
+    {
+        frame_draw_byte(x0, y, 0x03);
+        frame_draw_byte(x1, y, 0x03);
+    }
+    frame_draw_line(x0, y0, x1, y1);
+    frame_draw_line(x0, y1, x1, y0);
+}
+
+static void frame_draw_filled_triangle(int x0, int y0, int x1, int y1, int x2, int y2)
+{
+    /* Sort the vertices by y-coordinate ascending (y0 <= y1 <= y2) */
+    if (y0 > y1) { int temp = y0; y0 = y1; y1 = temp; temp = x0; x0 = x1; x1 = temp; }
+    if (y1 > y2) { int temp = y1; y1 = y2; y2 = temp; temp = x1; x1 = x2; x2 = temp; }
+    if (y0 > y1) { int temp = y0; y0 = y1; y1 = temp; temp = x0; x0 = x1; x1 = temp; }
+
+    int total_height = y2 - y0;
+    for (int i = 0; i < total_height; i++)
+    {
+        bool second_half = i > (y1 - y0) || (y1 == y0);
+        int segment_height = second_half ? (y2 - y1) : (y1 - y0);
+        float alpha = (float)i / total_height,
+              beta  = (float)(i - (second_half ? (y1 - y0) : 0)) / segment_height;
+        int ax = x0 + (int)(alpha * (x2 - x0)),
+            bx = second_half ? x1 + (int)(beta * (x2 - x1)) : x0 + (int)(beta * (x1 - x0));
+        if (ax > bx) { int temp = ax; ax = bx; bx = temp; }
+        for (int j = ax; j <= bx; j++)
         {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
+            frame_draw_pixel(j, y0 + i);
         }
     }
 }
 
-static void frame_draw_arrow(uint16_t radians, int x, int y, int length)
+static void frame_draw_compass(int x, int y, uint16_t degrees, int length)
 {
-    /* Draw a line for the arrow shaft */
-    int end_x = x + length * cos(radians),
-        end_y = y + length * sin(radians);
-    frame_draw_line(x, y, end_x, end_y);
+    /* Convert degrees to radians and adjust so 0 degrees is pointing up */
+    float radians = degrees * (M_PI / 180.0f);
+    /* Draw a circle for the compass background */
+    frame_draw_circle(x, y, length);
+    /* Screen space unit vector in the direction of the wind */
+    double dx      = sin(radians),
+           dy      = -cos(radians),
+    /* Perpendicular vector for the arrowhead */
+           px      = dy,
+           py      = -dx,
+    /* Coordinates where the arrowhead is attached to the line */
+           base_cx = x + 0.35 * length * dx,
+           base_cy = y + 0.35 * length * dy;
+    /* Second set of coordinates for the line of the arrow */
+    int    edge_x  = (int)round(x + length * dx),
+           edge_y  = (int)round(y + length * dy),
+    /* Coordinates for the tip of the arrow */
+           tip_x   = (int)round(x + 0.80 * length * dx),
+           tip_y   = (int)round(y + 0.80 * length * dy),
+    /* Coordinates for two sides of the triangle for the arrowhead, using the perpendicular vector */
+           b1x     = (int)round(base_cx + 0.20 * length * px),
+           b1y     = (int)round(base_cy + 0.20 * length * py),
+           b2x     = (int)round(base_cx - 0.20 * length * px),
+           b2y     = (int)round(base_cy - 0.20 * length * py);
+    frame_draw_line(x, y, edge_x, edge_y);
 
-    /* Draw two lines for the arrow head at 30 degree angles from the shaft */
-    int head_length = length / 4;
-    frame_draw_line(end_x, end_y,
-                    end_x - head_length * cos(radians - M_PI / 6),
-                    end_y - head_length * sin(radians - M_PI / 6));
-    frame_draw_line(end_x, end_y,
-                    end_x - head_length * cos(radians + M_PI / 6),
-                    end_y - head_length * sin(radians + M_PI / 6));
+    /* Manual adjustments to make arrowhead look better */
+    if (degrees >= 0 && degrees < 45)
+    { tip_x += 6; tip_y -= 2; b1x += 4; b1y -= 2; b2x += 8; b2y -= 2; }
+    else if (degrees >= 45 && degrees < 90)
+    { tip_x += 8; tip_y -= 3; b1x += 6; b1y -= 2; b2x += 8; b2y += 0; }
+    else if (degrees >= 90 && degrees < 135)
+    { tip_x += 10; tip_y += 0; b1x += 8; b1y += 0; b2x += 8; b2y += 0; }
+    else if (degrees >= 135 && degrees < 180)
+    { tip_x += 8; tip_y += 3; b1x += 8; b1y += 0; b2x += 6; b2y += 2; }
+    else if (degrees >= 180 && degrees < 225)
+    { tip_x += 6; tip_y += 2; b1x += 8; b1y += 2; b2x += 4; b2y += 2; }
+    else if (degrees >= 225 && degrees < 270)
+    { tip_x += 3; tip_y += 3; b1x += 8; b1y += 0; b2x += 6; b2y -= 2; }
+    else if (degrees >= 270 && degrees < 315)
+    { tip_x += 2; tip_y += 0; b1x += 6; b1y += 2; b2x += 6; b2y -= 2; }
+    else if (degrees >= 315 && degrees < 360)
+    { tip_x += 3; tip_y -= 3; b1x += 6; b1y += 2; b2x += 8; b2y -= 2; }
+    frame_draw_filled_triangle(tip_x, tip_y, b1x, b1y, b2x, b2y);
+
+    /* Draw N, E, S, W indicators */
+    frame_draw_char(font16, 'N', x - (font16.width / 2) + 6, y - length - font16.height);
+    frame_draw_char(font16, 'E', x + length + 10, y - (font16.height / 2));
+    frame_draw_char(font16, 'S', x - (font16.width / 2) + 8, y + length + 2);
+    frame_draw_char(font16, 'W', x - length - font16.width + 4, y - (font16.height / 2));
 }
 
 static void frame_draw_time(uint16_t x, uint16_t y)
 {
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    UPDATE_TIME;
     uint16_t hour = timeinfo.tm_hour % 12,
              minute = timeinfo.tm_min,
              afternoon = (timeinfo.tm_hour >= 12) ? 0 : 1;
@@ -766,7 +875,7 @@ static void frame_draw_time(uint16_t x, uint16_t y)
         13
     };
 
-    for (int i = 0; i < 7; i++)
+    for (int i = 0; i < sizeof(time); i++)
     {
         switch (time[i])
         {
@@ -788,104 +897,146 @@ static void frame_draw_time(uint16_t x, uint16_t y)
     }
 }
 
-static void frame_draw_default()
+static void frame_draw_icon(int x, int y, uint16_t weather_id)
 {
-    frame_draw_image(icon_thunder, sizeof(icon_thunder), 20, 20);
-    frame_draw_string(font20, "Currently, ", 10, 130);
-    frame_draw_string(font40, "76.4", 30, 160);
-    frame_draw_circle((28 + (font40.width * 4) - (font40.width / 2)), 165, 5);
-    frame_draw_string(font20, "feels like", 140, 180);
-    frame_draw_string(font24, "74.2", 290, 176);
-    frame_draw_circle((290 + (font24.width * 4) - (font24.width / 2)), 176, 3);
-    frame_draw_string(font24, "High: ", 175, 20);
-    frame_draw_string(font24, "80.1", 260, 20);
-    frame_draw_circle((260 + (font20.width * 4) - (font20.width / 2)), 20, 3);
-    frame_draw_string(font24, "Low: ", 175, 50);
-    frame_draw_string(font24, "65.2", 260, 50);
-    frame_draw_circle((260 + (font20.width * 4) - (font20.width / 2)), 50, 3);
-    frame_draw_string(font16, "Wind", 175, 80);
-    frame_draw_string(font16, "Speed", 175, 95);
-    frame_draw_image(icon_wind, sizeof(icon_wind), 235, 75);
-    frame_draw_string(font24, "9.6", 290, 85);
-    frame_draw_string(font20, "mph", (290 + (font24.width * 3) - (font24.width / 2)), 85);
-    frame_draw_arrow(180, 380, 90, 15);
-    frame_draw_string(font16, "Cloud", 175, 125);
-    frame_draw_string(font16, "Cover", 175, 140);
-    frame_draw_image(icon_cloud_small, sizeof(icon_cloud_small), 240, 120);
-    frame_draw_string(font24, "45", 295, 130);
-    frame_draw_string(font20, "%", (285 + (font24.width * 3) - (font24.width / 2)), 125);
-    frame_draw_time(CLOCK_X, CLOCK_Y);
-}
-
-static void rtc_gpio_init_all()
-{
-    /* CS pin selects which SPI device to talk, strictly unnecessary with one device but
-     * toggling it anyway just for thoroughness */
-    assert(rtc_gpio_is_valid_gpio(CS_PIN));
-    gpio_reset_pin(CS_PIN);
-    rtc_gpio_init(CS_PIN);
-    rtc_gpio_set_direction(CS_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
-    rtc_gpio_set_level(CS_PIN, HIGH);
-    gpio_intr_disable(CS_PIN);
-
-    /* DC pin determines whether the byte being sent is as a command or data */
-    assert(rtc_gpio_is_valid_gpio(DC_PIN));
-    gpio_reset_pin(DC_PIN);
-    rtc_gpio_init(DC_PIN);
-    rtc_gpio_set_direction(DC_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
-    gpio_intr_disable(DC_PIN);
-
-    /* RST pin is active low and is used to start the display */
-    assert(rtc_gpio_is_valid_gpio(RST_PIN));
-    gpio_reset_pin(RST_PIN);
-    rtc_gpio_init(RST_PIN);
-    rtc_gpio_set_direction(RST_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
-    rtc_gpio_set_level(RST_PIN, HIGH);
-    gpio_intr_disable(RST_PIN);
-
-    /* BUSY pin is an input that the display holds high when it's busy processing data, so the microcontroller
-     * knows not to send more data until it goes low again */
-    assert(rtc_gpio_is_valid_gpio(BUSY_PIN));
-    gpio_reset_pin(BUSY_PIN);
-    rtc_gpio_init(BUSY_PIN);
-    rtc_gpio_set_direction(BUSY_PIN, RTC_GPIO_MODE_INPUT_ONLY);
-    gpio_intr_disable(BUSY_PIN);
-
-    /* MOSI pin is used to send data to the display */
-    assert(rtc_gpio_is_valid_gpio(MOSI_PIN));
-    gpio_reset_pin(MOSI_PIN);
-    rtc_gpio_init(MOSI_PIN);
-    rtc_gpio_set_direction(MOSI_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
-    gpio_intr_disable(MOSI_PIN);
-
-    /* SCK pin is used to clock in the data on the MOSI pin */
-    assert(rtc_gpio_is_valid_gpio(SCK_PIN));
-    gpio_reset_pin(SCK_PIN);
-    rtc_gpio_init(SCK_PIN);
-    rtc_gpio_set_direction(SCK_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
-    gpio_intr_disable(SCK_PIN);
+    /* Weather condition codes documented at https://openweathermap.org/weather-conditions */
+    if (weather_id >= THUNDERSTORM_START && weather_id < DRIZZLE_START)
+    {
+        frame_draw_image(icon_thunder, sizeof(icon_thunder), x, y);
+    }
+    else if (weather_id >= DRIZZLE_START && weather_id < RAIN_START)
+    {
+        frame_draw_image(icon_drizzle, sizeof(icon_drizzle), x, y);
+    }
+    else if (weather_id >= RAIN_START && weather_id < SNOW_START)
+    {
+        frame_draw_image(icon_rain, sizeof(icon_rain), x, y);
+    }
+    else if (weather_id >= SNOW_START && weather_id < ATMOSPHERE_START)
+    {
+        frame_draw_image(icon_snow, sizeof(icon_snow), x, y);
+    }
+    else if (weather_id >= ATMOSPHERE_START && weather_id < CLEAR_SKY)
+    {
+        frame_draw_image(icon_haze, sizeof(icon_haze), x, y);
+    }
+    else if (weather_id == CLEAR_SKY)
+    {
+        frame_draw_image(icon_sun, sizeof(icon_sun), x, y);
+    } else {
+        frame_draw_image(icon_cloud, sizeof(icon_cloud), x, y);
+    }
 }
 
 static char *float_to_string(float value)
 {
     static char buffer[16];
-    snprintf(buffer, sizeof(buffer), "%.1f", value);
+    if ((int)value == value)
+    {
+        snprintf(buffer, sizeof(buffer), "%d", (int)value); // Trim trailing .0 for whole numbers
+    } else {
+        snprintf(buffer, sizeof(buffer), "%.1f", value);
+    }
     return buffer;
+}
+
+static uint16_t float_str_width(float value, uint16_t font_width)
+{
+    char *str = float_to_string(value);
+    float str_width = strlen(str) * font_width;
+    if (font_width <= 22)
+    {
+        str_width -= (strchr(str, '.') != NULL) ? font_width : 0;
+    } else {
+        str_width -= (strchr(str, '.') != NULL) ? (font_width / 2) : 0;
+    }
+    return str_width;
+}
+
+static void frame_draw_default()
+{
+    /* Quadrant 1: Current time and date */
+    UPDATE_TIME;
+    char timeinfo_str[64];
+    frame_draw_string(font24, "It is ", 450, 20);
+    strftime(timeinfo_str, sizeof(timeinfo_str), "%A,", &timeinfo);
+    frame_draw_string(font24, timeinfo_str, (font24.width * strlen("It is ")) + 450, 20);
+    strftime(timeinfo_str, sizeof(timeinfo_str), "%B %d, %Y", &timeinfo);
+    frame_draw_string(font24, timeinfo_str, 470, 50);
+    frame_draw_time(CLOCK_X, CLOCK_Y);
+
+    /* Quadrant 2: Current weather conditions */
+    frame_draw_icon(20, 20, weather.id);
+    frame_draw_string(font20, "Currently, ", 10, 130);
+    frame_draw_string(font40, float_to_string(weather.current_temp), 30, 160);
+    frame_draw_circle((28 + float_str_width(weather.current_temp, font40.width)), 165, 5);
+    frame_draw_string(font20, "feels like", 140, 180);
+    frame_draw_string(font24, float_to_string(weather.feels_like_temp), 290, 176);
+    frame_draw_circle((290 + float_str_width(weather.feels_like_temp, font24.width)), 176, 3);
+    frame_draw_string(font24, "High: ", 175, 20);
+    frame_draw_string(font24, float_to_string(weather.high_temp), 260, 20);
+    frame_draw_circle((260 + float_str_width(weather.high_temp, font24.width)), 20, 3);
+    frame_draw_string(font24, "Low: ", 175, 50);
+    frame_draw_string(font24, float_to_string(weather.low_temp), 260, 50);
+    frame_draw_circle((260 + float_str_width(weather.low_temp, font24.width)), 50, 3);
+    frame_draw_string(font16, "Wind", 175, 80);
+    frame_draw_string(font16, "Speed", 175, 95);
+    frame_draw_image(icon_wind, sizeof(icon_wind), 235, 75);
+    frame_draw_string(font24, float_to_string(weather.wind_speed), 285, 85);
+    frame_draw_string(font16, "mph", (285 + float_str_width(weather.wind_speed, font24.width)), 90);
+    frame_draw_compass(400, 100, weather.wind_direction_degrees, 15);
+    frame_draw_string(font16, "Cloud", 175, 125);
+    frame_draw_string(font16, "Cover", 175, 140);
+    frame_draw_image(icon_cloud_small, sizeof(icon_cloud_small), 240, 120);
+    frame_draw_string(font24, float_to_string(weather.cloudiness), 295, 130);
+    frame_draw_string(font20, "%", (295 + float_str_width(weather.cloudiness, font24.width)), 125);
+    /* TODO: Quadrant 3: Graph showing temperature and precipitaion chance */
+    /* TODO: Quadrant 4: Forecast for next few days */
+}
+
+static void rtc_gpio_init_all()
+{
+    const gpio_num_t all_pins[] = {CS_PIN, DC_PIN, RST_PIN, BUSY_PIN, MOSI_PIN, SCK_PIN, PWR_PIN};
+    for (size_t i = 0; i < sizeof(all_pins) / sizeof(all_pins[0]); i++)
+    {
+        assert(rtc_gpio_is_valid_gpio(all_pins[i]));
+        gpio_reset_pin(all_pins[i]);
+        rtc_gpio_init(all_pins[i]);
+        if (all_pins[i] == BUSY_PIN)
+        {
+            rtc_gpio_set_direction(all_pins[i], RTC_GPIO_MODE_INPUT_ONLY);
+        } else {
+            rtc_gpio_set_direction(all_pins[i], RTC_GPIO_MODE_OUTPUT_ONLY);
+        }
+        rtc_gpio_pulldown_dis(all_pins[i]);
+        rtc_gpio_pullup_dis(all_pins[i]);
+        gpio_intr_disable(all_pins[i]);
+    }
+    rtc_gpio_set_level(PWR_PIN, HIGH);
+    rtc_gpio_set_level(RST_PIN, HIGH);
+}
+
+static void rtc_gpio_set_low_all()
+{
+    rtc_gpio_set_level(CS_PIN, LOW);
+    rtc_gpio_set_level(DC_PIN, LOW);
+    rtc_gpio_set_level(RST_PIN, LOW);
+    rtc_gpio_set_level(MOSI_PIN, LOW);
+    rtc_gpio_set_level(SCK_PIN, LOW);
 }
 
 static void align_time_to_next_minute()
 {
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    UPDATE_TIME;
     int seconds_to_next_minute = 60 - timeinfo.tm_sec;
-    ESP_LOGI("time", "Current time: %02d:%02d:%02d, sleeping for %d seconds to align to next minute", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, seconds_to_next_minute);
+    ESP_LOGI("time",
+            "Current time: %02d:%02d:%02d, sleeping for %d seconds to align to next minute",
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, seconds_to_next_minute);
 
+    // TODO: This consumes alot of power, change to altering the ULP wakeup time
     vTaskDelay((seconds_to_next_minute * 1000) / portTICK_PERIOD_MS);
 
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    UPDATE_TIME;
     ulp_hours = timeinfo.tm_hour % 12;
     ulp_hours = (ulp_hours == 0) ? 12 : ulp_hours;
     ulp_minutes = timeinfo.tm_min;
@@ -893,17 +1044,9 @@ static void align_time_to_next_minute()
 
 void app_main()
 {
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay to allow time for the serial monitor to connect before printing logs
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for serial monitor
     /* Default log level is set to ERROR to speed up boot time, set it back to INFO */
     esp_log_level_set("*", ESP_LOG_INFO);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
-
-    /* Init ULP so its variables can be accessed and modified from the main CPU */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
-    ulp_set_wakeup_period(0, 100);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
-    ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
 
     /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
     esp_err_t ret = nvs_flash_init();
@@ -914,18 +1057,32 @@ void app_main()
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    wifi_init_sta();
-    sync_sntp_time();
-    https_get_task();
-
+    /* Init ULP so its variables can be accessed and modified from the main CPU */
     rtc_gpio_init_all();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
+    ulp_set_wakeup_period(0, 10);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
+    ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
+
+    // TODO: Split these into async tasks to speed them up, this is where the majority of run time is spent
+    // they initially need to run sequentially wifi -> sntp -> https but once time is stored in nvs,
+    // sntp and https can run in parallel after wifi is initialized
+    esp_netif_t *wifi = wifi_start();
+    // TODO: Store and retrieve sntp time in nvs
+    sync_sntp_time();
+    https_get_weather();
+    wifi_stop(wifi);
+    //test_weather_data();
 
     frame_draw_default();
     epd_init();
     epd_write_frame();
+    rtc_gpio_set_low_all();
 
     align_time_to_next_minute();
-    ulp_set_wakeup_period(0, (60 * 1000 * 1000) - 443000); // 60 seconds minus avg ULP execution time
+    ulp_set_wakeup_period(0, (60ULL * 1000ULL * 1000ULL)); // 60 seconds in uS
     ulp_riscv_timer_resume();
     esp_deep_sleep_start();
 }
