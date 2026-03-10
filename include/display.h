@@ -19,6 +19,8 @@
 #define PARTIAL_WINDOW      0x90
 #define PARTIAL_IN          0x91
 #define PARTIAL_OUT         0x92
+#define CASCADE_SETTING     0xe0
+#define FORCE_TEMPERATURE   0xe5
 
 /* GPIO Pin mappings */
 #define MOSI_PIN    GPIO_NUM_15
@@ -27,13 +29,18 @@
 #define DC_PIN      GPIO_NUM_4
 #define RST_PIN     GPIO_NUM_9
 #define BUSY_PIN    GPIO_NUM_18
+#define PWR_PIN     GPIO_NUM_7
 
 /* GPIO Pin states */
 #define HIGH    1
 #define LOW     0
 
+/* Used for clarity when calculating */
+#define BITS_PER_BYTE 8
+
 /* Display dimensions */
 #define EPD_WIDTH  800
+#define EPD_BYTE_WIDTH (EPD_WIDTH / BITS_PER_BYTE)
 #define EPD_HEIGHT 480
 
 /* Clock coordinates for display */
