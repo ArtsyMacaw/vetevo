@@ -14,17 +14,16 @@
  * - Leftover for stack and variables: ~1.7KB
  */
 
-#define CHAR_SIZE      510
 #define CHAR_HEIGHT    85
 #define CHAR_WIDTH     48
-#define NUM_CHARS      5
-#define BITS_PER_BYTE  8
+#define CHAR_SIZE      ((CHAR_WIDTH * CHAR_HEIGHT) / BITS_PER_BYTE)
+#define NUM_CHARS      5 // HH:MM time format
 
 static const uint8_t font60_table[]; // MSB is the pixel value, lower 7 bits are the run length
 static uint8_t time[CHAR_HEIGHT][(CHAR_WIDTH * NUM_CHARS) / BITS_PER_BYTE];
 static uint8_t dst[CHAR_SIZE];
 
-/* Offsets */
+/* Offsets in font60_table */
 enum {
     ONE         = 0,
     TWO         = 118,
@@ -57,6 +56,8 @@ enum {
 /* Global time variables to track the current wall clock time set by main CPU */
 volatile uint32_t hours     = 0;
 volatile uint32_t minutes   = 0;
+volatile uint32_t old_hours = 0;
+volatile uint32_t old_minutes = 0;
 
 /* RTC calibration value calculated by the main CPU */
 volatile uint32_t clk_cal = 0;
@@ -69,9 +70,8 @@ volatile uint32_t bytes_written  = 0;
 volatile uint32_t epd_started    = 0;
 volatile uint32_t chars_drawn    = 0;
 volatile uint32_t frame_drawn    = 0;
-volatile uint32_t epd_reset_done = 0;
+volatile uint32_t delay_ms       = 0;
 volatile uint32_t sleep_cycles   = 0;
-volatile uint32_t drift_cycles   = 0;
 
 /* Decompress the RLE compressed font table */
 void rle_decompress(const uint8_t *src, size_t src_size, size_t bit_count)
@@ -130,7 +130,6 @@ static void epd_reset()
     ulp_riscv_delay_cycles(20 * ULP_RISCV_CYCLES_PER_MS);
     ulp_riscv_gpio_output_level(RST_PIN, HIGH);
     ulp_riscv_delay_cycles(20 * ULP_RISCV_CYCLES_PER_MS);
-    epd_reset_done = 1;
 }
 
 static void epd_wait_until_idle()
@@ -178,54 +177,36 @@ static void epd_init()
     spi_write_data(0x22);
 
     spi_write_command(VCOM_DATA_INTERVAL);
-    spi_write_data(0x10);
+    spi_write_data(0x18);
     spi_write_data(0x07);
+
+    /*
+    spi_write_command(CASCADE_SETTING);
+    spi_write_data(0x02);
+    spi_write_command(FORCE_TEMPERATURE);
+    spi_write_data(0x5a);
+    */
+
     epd_started = 1;
 }
 
-// TODO: Add epd_fast_init that changes setting to fast refresh
 static void epd_sleep()
 {
     spi_write_command(POWER_OFF);
-    spi_write_command(DEEP_SLEEP);
-    spi_write_data(0xA5);
 }
 
-/* Needs to be done every 10 partial updates to prevent ghosting */
 static void epd_full_refresh()
 {
+    epd_reset();
+    spi_write_command(BOOSTER_SOFT_START);
+    spi_write_data(0x17);
+    spi_write_data(0x17);
+    spi_write_data(0x27);
+    spi_write_data(0x17);
+    spi_write_command(0x17);
+    spi_write_data(0xA5);
     epd_wait_until_idle();
-    spi_write_command(DISPLAY_REFRESH);
     epd_sleep();
-}
-
-static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
-{
-    epd_wait_until_idle();
-    spi_write_command(PARTIAL_WINDOW);
-    spi_write_data(x / 256);
-    spi_write_data(x % 256);
-    spi_write_data((x + w - 1) / 256);
-    spi_write_data((x + w - 1) % 256);
-    spi_write_data(y / 256);
-    spi_write_data(y % 256);
-    spi_write_data((y + h - 1) / 256);
-    spi_write_data((y + h - 1) % 256);
-    spi_write_data(0x00);
-
-    spi_write_command(PARTIAL_IN);
-    spi_write_command(TRANSFER_DATA_2);
-    for (int i = 0; i < h; i++)
-    {
-        for (int j = 0; j < (w / 8); j++)
-        {
-            spi_write_data(time[i][j]);
-        }
-    }
-    spi_write_command(DISPLAY_REFRESH);
-    spi_write_command(PARTIAL_OUT);
-    epd_wait_until_idle();
-    frame_drawn++;
 }
 
 static void frame_draw_giant_char(uint32_t offset, uint32_t rle_size, uint8_t place)
@@ -247,17 +228,17 @@ static void frame_draw_giant_char(uint32_t offset, uint32_t rle_size, uint8_t pl
     chars_drawn++;
 }
 
-static void frame_draw_time()
+static void frame_draw_time(uint32_t hour, uint32_t minute)
 {
     uint8_t time[] =
     {
-        (hours / 10) % 10,
-        hours % 10,
+        (hour / 10) % 10,
+        hour % 10,
         10, // :
-        (minutes / 10) % 10,
-        minutes % 10
+        (minute / 10) % 10,
+        minute % 10
     };
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < sizeof(time); i++)
     {
         uint32_t offset, size;
         switch (time[i])
@@ -279,17 +260,71 @@ static void frame_draw_time()
     }
 }
 
+static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
+{
+    epd_wait_until_idle();
+    spi_write_command(PARTIAL_WINDOW);
+    spi_write_data(x / 256);
+    spi_write_data(x % 256);
+    spi_write_data((x + w - 1) / 256);
+    spi_write_data((x + w - 1) % 256);
+    spi_write_data(y / 256);
+    spi_write_data(y % 256);
+    spi_write_data((y + h - 1) / 256);
+    spi_write_data((y + h - 1) % 256);
+    spi_write_data(0x00);
+
+    spi_write_command(PARTIAL_IN);
+    if (wakeups > 2)
+    {
+        frame_draw_time(old_hours, old_minutes);
+        spi_write_command(TRANSFER_DATA_1);
+        for (int i = 0; i < h; i++)
+        {
+            for (int j = 0; j < (w / 8); j++)
+            {
+                spi_write_data(time[i][j]);
+            }
+        }
+    }
+    old_hours = hours;
+    old_minutes = minutes;
+
+    frame_draw_time(hours, minutes);
+    spi_write_command(TRANSFER_DATA_2);
+    for (int i = 0; i < h; i++)
+    {
+        for (int j = 0; j < (w / 8); j++)
+        {
+            spi_write_data(time[i][j]);
+        }
+    }
+    spi_write_command(DISPLAY_REFRESH);
+    spi_write_command(PARTIAL_OUT);
+    epd_wait_until_idle();
+    frame_drawn++;
+}
+
 static uint64_t time_get()
 {
     REG_SET_BIT(RTC_CNTL_TIME_UPDATE_REG, RTC_CNTL_TIME_UPDATE);
     while (REG_GET_BIT(RTC_CNTL_TIME_UPDATE_REG, RTC_CNTL_TIME_UPDATE))
     {
-        // Empty
+        // Wait for time registers to update
     }
-    uint32_t low = REG_READ(RTC_CNTL_TIME0_REG);
-    uint32_t high = REG_READ(RTC_CNTL_TIME1_REG);
+    uint32_t low = REG_READ(RTC_CNTL_TIME0_REG),
+             high = REG_READ(RTC_CNTL_TIME1_REG);
 
     return ((uint64_t)high << 32) | (uint64_t) low;
+}
+
+static void rtc_gpio_set_all_low()
+{
+    ulp_riscv_gpio_output_level(MOSI_PIN, LOW);
+    ulp_riscv_gpio_output_level(SCK_PIN, LOW);
+    ulp_riscv_gpio_output_level(CS_PIN, LOW);
+    ulp_riscv_gpio_output_level(DC_PIN, LOW);
+    ulp_riscv_gpio_output_level(RST_PIN, LOW);
 }
 
 int main()
@@ -305,34 +340,31 @@ int main()
     launched = 1;
     uint64_t start_time = time_get();
 
-    frame_draw_time();
-    minutes = (minutes + 1) % 60; // Increment minutes every wakeup, and roll over to hours after 60
-    hours = (hours + (minutes == 0 ? 1 : 0)) % 12; // Increment hours after 60 minutes, and roll over after 12
-    hours = (hours == 0) ? 12 : hours; // Display 12 instead of 0 for the hour
 
     epd_init();
-    // TODO: Passing old time frame buffer may help with ghosting? Unclear need to confirm
     epd_write_partial(CLOCK_X, CLOCK_Y, (CHAR_WIDTH * NUM_CHARS), CHAR_HEIGHT);
-
-    if ((wakeups % 10) == 1)
+    epd_sleep();
+    if ((wakeups % 5) == 1)
     {
         epd_full_refresh();
-    } else {
-        epd_sleep();
     }
+    rtc_gpio_set_all_low();
+
+    minutes = (minutes + 1) % 60; // Increment minutes every wakeup, and roll over to hours after 60
+    hours = (hours + (minutes == 0 ? 1 : 0)) % 12; // Increment hours after 60 minutes, and roll over after 12
 
     /* Calculate execution time and adjust timer to ensure wakeup occurs at the start of every minute */
-    uint64_t end_time = time_get();
-    uint64_t elapsed_cycles = end_time - start_time;
-    uint64_t target_cycles = ((((60 * 1000 * 1000)+ 1) / clk_cal) << RTC_CLK_CAL_FRACT)
-        + ((((60 * 1000 * 1000) + 1) % clk_cal) << RTC_CLK_CAL_FRACT) / clk_cal; // 60 seconds
+    uint64_t end_time = time_get(),
+             elapsed_cycles = end_time - start_time,
+             target_cycles = (((60UL * 1000UL * 1000UL) / clk_cal) << RTC_CLK_CAL_FRACT)
+                + (((60UL * 1000UL * 1000UL) % clk_cal) << RTC_CLK_CAL_FRACT) / clk_cal; // 60 seconds
     sleep_cycles = (uint32_t)(target_cycles - elapsed_cycles);
-    sleep_cycles += drift_cycles;
     REG_SET_FIELD(RTC_CNTL_ULP_CP_TIMER_1_REG, RTC_CNTL_ULP_CP_TIMER_SLP_CYCLE, sleep_cycles);
 
     if ((wakeups % 10) == 1)
     {
-        ulp_riscv_delay_cycles(6000 * ULP_RISCV_CYCLES_PER_MS);
+        delay_ms = 5600 * 17.5 * 1000;
+        ulp_riscv_delay_cycles(delay_ms);
     }
 }
 
