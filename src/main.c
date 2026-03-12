@@ -36,6 +36,12 @@
 
 // TODO: use espidf heap tracing to check for memory leaks
 // TODO: go through and correctly handle all the ESP_ERROR_CHECKS
+/* Main event group */
+static EventGroupHandle_t event_group = NULL;
+#define WIFI_DONE_BIT BIT0
+#define SNTP_DONE_BIT BIT1
+#define WEATHER_DONE_BIT BIT2
+#define ALL_DONE_BITS (WIFI_DONE_BIT | SNTP_DONE_BIT | WEATHER_DONE_BIT)
 
 /* Wall clock time */
 static time_t now;
@@ -45,6 +51,7 @@ static struct tm timeinfo;
 /* Wifi definitions and variables */
 static EventGroupHandle_t wifi_event_group;
 static int retry_num = 0;
+static esp_netif_t *wifi_if = NULL;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 #define MAX_RETRY_NUM      5
@@ -82,12 +89,12 @@ static struct weather_today
     float cloudiness; // % of sky covered by clouds
 } weather;
 
-#define HOURLY_FORECASTS 12
+#define FORECAST_HOURS 12
 static struct hourly_forecast
 {
     float temp;
-    float feels_like_temp;
-} hourly_forecast[HOURLY_FORECASTS];
+    float precipitation_chance;
+} hourly_forecast[FORECAST_HOURS];
 
 #define FORECAST_DAYS 5
 static struct weather_forecast
@@ -212,6 +219,7 @@ static esp_netif_t *wifi_start()
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
+    vEventGroupDelete(wifi_event_group);
 
     if (bits & WIFI_CONNECTED_BIT)
     {
@@ -237,6 +245,7 @@ static void wifi_stop(esp_netif_t *netif)
 
 static void https_get_weather()
 {
+    // TODO: Compress everything into one http GET request with 3.0 onecall
     esp_http_client_config_t config =
     {
         .host = "api.openweathermap.org",
@@ -373,9 +382,9 @@ static void https_get_weather()
     // TODO: cJSON_Delete should free every JSON object under it, but I should check with valgrind
     cJSON_Delete(json);
     esp_http_client_close(client);
+
     config.path = "/data/2.5/forecast?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&appid=" API_KEY;
     ESP_LOGI("http", "Getting weather forcasts...");
-
     client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_GET);
     err = esp_http_client_open(client, 0);
@@ -466,20 +475,100 @@ static void https_get_weather()
         }
     }
 
+    free(buffer);
+    cJSON_Delete(json);
+    esp_http_client_close(client);
+
+    config.path = "/data/3.0/onecall?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&exclude=current,minutely,daily,alerts&appid=" API_KEY;
+    ESP_LOGI("http", "Getting hourly forcasts...");
+    client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
+    err = esp_http_client_open(client, 0);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("http", "HTTP GET request failed: %s", esp_err_to_name(err));
+    }
+    content_length = esp_http_client_fetch_headers(client);
+    buffer = malloc(content_length + 1);
+    assert(buffer != NULL);
+    read_len = esp_http_client_read(client, buffer, content_length);
+    if (read_len >= 0)
+    {
+        buffer[read_len] = '\0';
+        ESP_LOGV("http", "Received data: %s", buffer);
+    } else {
+        ESP_LOGE("http", "Failed to read response");
+    }
+
+    /* Parse JSON response and populate the forecast array; data updates every three hours */
+    json = cJSON_ParseWithLength(buffer, content_length);
+    if (json == NULL)
+    {
+        const char *error_ptr = cJSON_GetErrorPtr();
+        if (error_ptr != NULL)
+        {
+            ESP_LOGE("json", "Error before: %s", error_ptr);
+        }
+    } else {
+        cJSON *hourly_array = cJSON_GetObjectItem(json, "hourly");
+        assert(cJSON_IsArray(hourly_array));
+        for (int i = 0; i < FORECAST_HOURS; i++)
+        {
+            cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i);
+            cJSON *temp = cJSON_GetObjectItem(hourly_item, "temp");
+            if (cJSON_IsNumber(temp))
+            {
+                hourly_forecast[i].temp = temp->valuedouble;
+                ESP_LOGI("hourly", "Hour %d Temp: %.2f F", i + 1, hourly_forecast[i].temp);
+            }
+            cJSON *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop");
+            if (cJSON_IsNumber(precipitation_chance))
+            {
+                hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+                ESP_LOGI("hourly", "Hour %d Precipitation Chance: %.2f%%", i + 1, hourly_forecast[i].precipitation_chance * 100);
+            }
+        }
+    }
+
     cJSON_Delete(json);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     free(buffer);
 }
 
-static void sync_sntp_time()
+static bool sntp_get_nvs_time()
 {
-    /* Configure SNTP to use the NTP pool server and synchronize time */
+    nvs_handle_t nvs_handle;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open("storage", NVS_READONLY, &nvs_handle));
+    if (nvs_get_i64(nvs_handle, "timestamp", &now) == ESP_OK)
+    {
+        ESP_LOGI("sntp", "Retrieved timestamp from NVS: %lld", now);
+        localtime_r(&now, &timeinfo);
+        nvs_close(nvs_handle);
+        return true;
+    } else {
+        ESP_LOGI("sntp", "No timestamp found in NVS");
+        nvs_close(nvs_handle);
+        return false;
+    }
+}
+
+static void sntp_set_nvs_time()
+{
+    nvs_handle_t nvs_handle;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open("storage", NVS_READWRITE, &nvs_handle));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_i64(nvs_handle, "timestamp", now));
+    nvs_close(nvs_handle);
+    ESP_LOGI("sntp", "Saved timestamp to NVS: %lld", now);
+}
+
+static void sntp_sync_time()
+{
     esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_netif_sntp_init(&sntp_config);
 
     /* POSIX timezones */
-    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
+    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1); // CST
     tzset();
 
     if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK)
@@ -489,6 +578,7 @@ static void sync_sntp_time()
         ESP_LOGI("sntp", "Time synchronized successfully");
     }
     UPDATE_TIME;
+    sntp_set_nvs_time();
     char timeinfo_str[64];
     strftime(timeinfo_str, sizeof(timeinfo_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
     ESP_LOGI("sntp", "Current time: %s", timeinfo_str);
@@ -618,22 +708,12 @@ static void epd_write_frame()
     epd_wait_until_idle();
 }
 
-// TODO: Draw an error message if an unrecoverable error occurs to inform user ()
+// TODO: Draw an error message if an unrecoverable error occurs to inform user
 
 static void epd_sleep()
 {
     spi_write_command(POWER_OFF);
     epd_wait_until_idle();
-}
-
-static void frame_draw_pixel(int x, int y)
-{
-    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT)
-    {
-        ESP_LOGE("frame", "Pixel position out of bounds: x=%d, y=%d", x, y);
-        return;
-    }
-    frame[y][x / BITS_PER_BYTE] |= (0x80 >> (x % BITS_PER_BYTE));
 }
 
 static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
@@ -656,7 +736,7 @@ static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
 
 static void frame_draw_char(font_t font, char c, int x, int y)
 {
-    uint8_t bytes_per_char = font.width / BITS_PER_BYTE + (font.width % BITS_PER_BYTE != 0);
+    uint8_t bytes_per_char = (font.width / BITS_PER_BYTE) + (font.width % BITS_PER_BYTE != 0);
 
     /* Subtract the first character in the font from the character to get the index,
      * then multiply by the number of bytes per character to get the offset in the font data array */
@@ -679,7 +759,7 @@ static void frame_draw_char(font_t font, char c, int x, int y)
 
 static void frame_draw_giant_char(uint32_t offset, int x, int y)
 {
-    uint8_t bytes_per_char = font60.width / BITS_PER_BYTE + (font60.width % BITS_PER_BYTE != 0);
+    uint8_t bytes_per_char = (font60.width / BITS_PER_BYTE) + (font60.width % BITS_PER_BYTE != 0);
     const uint8_t *char_start = font60.table + offset;
 
     for (int i = 0; i < font60.height; i++)
@@ -698,7 +778,7 @@ static void frame_draw_string(font_t font, const char *str, int x, int y)
         /* Slightly cursed code to make periods look better */
         x -= (str[0] == '.' && font.width < 20) ? ((font.width / 2) - 1) : 0;
         frame_draw_char(font, *str, x, y);
-        x += (str[0] != '.') ? font.width : ((font.width / 2) + 1);
+        x += (str[0] != '.') ? font.width : ((font.width / 2) + 2);
         str++;
     }
 }
@@ -727,14 +807,14 @@ static void frame_draw_circle(int center_x, int center_y, int radius)
 
     while (y <= x)
     {
-        frame_draw_byte(center_x + x, center_y + y, 0x03);
-        frame_draw_byte(center_x + y, center_y + x, 0x03);
-        frame_draw_byte(center_x - x, center_y + y, 0x03);
-        frame_draw_byte(center_x - y, center_y + x, 0x03);
-        frame_draw_byte(center_x - x, center_y - y, 0x03);
-        frame_draw_byte(center_x - y, center_y - x, 0x03);
-        frame_draw_byte(center_x + x, center_y - y, 0x03);
-        frame_draw_byte(center_x + y, center_y - x, 0x03);
+        frame_draw_byte(center_x + x, center_y + y, 0xc0);
+        frame_draw_byte(center_x + y, center_y + x, 0xc0);
+        frame_draw_byte(center_x - x, center_y + y, 0xc0);
+        frame_draw_byte(center_x - y, center_y + x, 0xc0);
+        frame_draw_byte(center_x - x, center_y - y, 0xc0);
+        frame_draw_byte(center_x - y, center_y - x, 0xc0);
+        frame_draw_byte(center_x + x, center_y - y, 0xc0);
+        frame_draw_byte(center_x + y, center_y - x, 0xc0);
         y++;
         if (decision_over_2 <= 0) { decision_over_2 += 2 * y + 1; }
         else                      { x--; decision_over_2 += 2 * (y - x) + 1; }
@@ -752,7 +832,7 @@ static void frame_draw_line(int x0, int y0, int x1, int y1)
         e2; // error value e_xy
     while (1)
     {
-        frame_draw_byte(x0, y0, 0x03);
+        frame_draw_byte(x0, y0, 0xc0);
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
         if (e2 >= dy) { err += dy; x0 += sx; }
@@ -779,24 +859,39 @@ static void frame_draw_x_rectangle(int x0, int y0, int x1, int y1)
 
 static void frame_draw_filled_triangle(int x0, int y0, int x1, int y1, int x2, int y2)
 {
-    /* Sort the vertices by y-coordinate ascending (y0 <= y1 <= y2) */
-    if (y0 > y1) { int temp = y0; y0 = y1; y1 = temp; temp = x0; x0 = x1; x1 = temp; }
-    if (y1 > y2) { int temp = y1; y1 = y2; y2 = temp; temp = x1; x1 = x2; x2 = temp; }
-    if (y0 > y1) { int temp = y0; y0 = y1; y1 = temp; temp = x0; x0 = x1; x1 = temp; }
+    frame_draw_line(x0, y0, x1, y1);
+    frame_draw_line(x1, y1, x2, y2);
+    frame_draw_line(x2, y2, x0, y0);
 
-    int total_height = y2 - y0;
-    for (int i = 0; i < total_height; i++)
+    int t;
+    if (y0 > y1) { t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    if (y0 > y2) { t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t; }
+    if (y1 > y2) { t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
+    int total_h = y2 - y0;
+
+    for (int y = y0; y <= y2; y++)
     {
-        bool second_half = i > (y1 - y0) || (y1 == y0);
-        int segment_height = second_half ? (y2 - y1) : (y1 - y0);
-        float alpha = (float)i / total_height,
-              beta  = (float)(i - (second_half ? (y1 - y0) : 0)) / segment_height;
-        int ax = x0 + (int)(alpha * (x2 - x0)),
-            bx = second_half ? x1 + (int)(beta * (x2 - x1)) : x0 + (int)(beta * (x1 - x0));
-        if (ax > bx) { int temp = ax; ax = bx; bx = temp; }
-        for (int j = ax; j <= bx; j++)
+        int xa = (int)(x0 + (double)(x2 - x0) * (y - y0) / total_h);
+        int xb;
+        if (y <= y1)
         {
-            frame_draw_pixel(j, y0 + i);
+            int seg = y1 - y0;
+            xb = (seg == 0) ? x0 : (int)(x0 + (double)(x1 - x0) * (y - y0) / seg);
+        } else {
+            int seg = y2 - y1;
+            xb = (seg == 0) ? x1 : (int)(x1 + (double)(x2 - x1) * (y - y1) / seg);
+        }
+        if (xa > xb) { t = xa; xa = xb; xb = t; }
+
+        int remaining = xb - xa + 1,
+            x = xa;
+        while (remaining > 0)
+        {
+            int bits = (remaining > 8) ? 8 : remaining;
+            uint8_t mask = (uint8_t)(0xFF00u >> bits);
+            frame_draw_byte(x, y, mask);
+            x += bits;
+            remaining -= bits;
         }
     }
 }
@@ -823,36 +918,18 @@ static void frame_draw_compass(int x, int y, uint16_t degrees, int length)
            tip_x   = (int)round(x + 0.80 * length * dx),
            tip_y   = (int)round(y + 0.80 * length * dy),
     /* Coordinates for two sides of the triangle for the arrowhead, using the perpendicular vector */
-           b1x     = (int)round(base_cx + 0.20 * length * px),
-           b1y     = (int)round(base_cy + 0.20 * length * py),
-           b2x     = (int)round(base_cx - 0.20 * length * px),
-           b2y     = (int)round(base_cy - 0.20 * length * py);
+           b1x     = (int)round(base_cx + 0.30 * length * px),
+           b1y     = (int)round(base_cy + 0.30 * length * py),
+           b2x     = (int)round(base_cx - 0.30 * length * px),
+           b2y     = (int)round(base_cy - 0.30 * length * py);
     frame_draw_line(x, y, edge_x, edge_y);
-
-    /* Manual adjustments to make arrowhead look better */
-    if (degrees >= 0 && degrees < 45)
-    { tip_x += 6; tip_y -= 2; b1x += 4; b1y -= 2; b2x += 8; b2y -= 2; }
-    else if (degrees >= 45 && degrees < 90)
-    { tip_x += 8; tip_y -= 3; b1x += 6; b1y -= 2; b2x += 8; b2y += 0; }
-    else if (degrees >= 90 && degrees < 135)
-    { tip_x += 10; tip_y += 0; b1x += 8; b1y += 0; b2x += 8; b2y += 0; }
-    else if (degrees >= 135 && degrees < 180)
-    { tip_x += 8; tip_y += 3; b1x += 8; b1y += 0; b2x += 6; b2y += 2; }
-    else if (degrees >= 180 && degrees < 225)
-    { tip_x += 6; tip_y += 2; b1x += 8; b1y += 2; b2x += 4; b2y += 2; }
-    else if (degrees >= 225 && degrees < 270)
-    { tip_x += 3; tip_y += 3; b1x += 8; b1y += 0; b2x += 6; b2y -= 2; }
-    else if (degrees >= 270 && degrees < 315)
-    { tip_x += 2; tip_y += 0; b1x += 6; b1y += 2; b2x += 6; b2y -= 2; }
-    else if (degrees >= 315 && degrees < 360)
-    { tip_x += 3; tip_y -= 3; b1x += 6; b1y += 2; b2x += 8; b2y -= 2; }
     frame_draw_filled_triangle(tip_x, tip_y, b1x, b1y, b2x, b2y);
 
     /* Draw N, E, S, W indicators */
-    frame_draw_char(font16, 'N', x - (font16.width / 2) + 6, y - length - font16.height);
-    frame_draw_char(font16, 'E', x + length + 10, y - (font16.height / 2));
-    frame_draw_char(font16, 'S', x - (font16.width / 2) + 8, y + length + 2);
-    frame_draw_char(font16, 'W', x - length - font16.width + 4, y - (font16.height / 2));
+    frame_draw_char(font16, 'N', x - (font16.width / 2), y - length - font16.height);
+    frame_draw_char(font16, 'E', x + length + 4, y - (font16.height / 2));
+    frame_draw_char(font16, 'S', x - (font16.width / 2) + 2, y + length + 2);
+    frame_draw_char(font16, 'W', x - length - font16.width - 2, y - (font16.height / 2));
 }
 
 static void frame_draw_time(uint16_t x, uint16_t y)
@@ -928,6 +1005,53 @@ static void frame_draw_icon(int x, int y, uint16_t weather_id)
     }
 }
 
+/* Draw graph of two sets of points with different y-axes, used for the temperature and precipitation forecast graph
+ * first series of points is drawn with a solid line and the second series is drawn with as dashed boxes */
+static void frame_draw_graph(int x1, int y1, int x2, int y2, float min_value, float max_value,
+        const float *points, size_t num_points, int num_y_labels, const char *y_label_format,
+        const float *points2, size_t num_points2, int num_y_labels2, const char *y_label_format2)
+{
+    /* Draw one base line for x axis and two base lines for the y axes */
+    frame_draw_line(x1, y2, x2, y2);
+    frame_draw_line(x1, y1, x1, y2);
+    frame_draw_line(x2, y1, x2, y2);
+    /* Draw labels for y axes */
+    for (int i = 0; i < num_y_labels; i++)
+    {
+        float value = min_value + i * (max_value - min_value) / (num_y_labels - 1);
+        char label[16];
+        snprintf(label, sizeof(label), y_label_format, value);
+        frame_draw_string(font16, label,
+                x1 - (font16.width * strlen(label)) - 5,
+                y2 - ((y2 - y1) * i / (num_y_labels - 1)) - (font16.height / 2));
+    }
+    for (int i = 0; i < num_y_labels2; i++)
+    {
+        float value = min_value + i * (max_value - min_value) / (num_y_labels2 - 1);
+        char label[16];
+        snprintf(label, sizeof(label), y_label_format2, value);
+        frame_draw_string(font16, label,
+                x2 + 5,
+                y2 - ((y2 - y1) * i / (num_y_labels2 - 1)) - (font16.height / 2));
+    }
+    /* Draw points and lines for first series */
+    for (size_t i = 0; i < num_points - 1; i++)
+    {
+        int x_start = x1 + (i * (x2 - x1) / (num_points - 1)),
+            y_start = y2 - ((points[i] - min_value) * (y2 - y1) / (max_value - min_value)),
+            x_end = x1 + ((i + 1) * (x2 - x1) / (num_points - 1)),
+            y_end = y2 - ((points[i + 1] - min_value) * (y2 - y1) / (max_value - min_value));
+        frame_draw_line(x_start, y_start, x_end, y_end);
+    }
+    /* Draw points for second series as dashed boxes */
+    for (size_t i = 0; i < num_points2; i++)
+    {
+        int x_center = x1 + (i * (x2 - x1) / (num_points2 - 1)),
+            y_center = y2 - ((points2[i] - min_value) * (y2 - y1) / (max_value - min_value));
+        frame_draw_x_rectangle(x_center - 3, y_center - 3, x_center + 3, y_center + 3);
+    }
+}
+
 static char *float_to_string(float value)
 {
     static char buffer[16];
@@ -969,16 +1093,16 @@ static void frame_draw_default()
     frame_draw_icon(20, 20, weather.id);
     frame_draw_string(font20, "Currently, ", 10, 130);
     frame_draw_string(font40, float_to_string(weather.current_temp), 30, 160);
-    frame_draw_circle((28 + float_str_width(weather.current_temp, font40.width)), 165, 5);
+    frame_draw_circle((30 + float_str_width(weather.current_temp, font40.width)), 165, 5);
     frame_draw_string(font20, "feels like", 140, 180);
     frame_draw_string(font24, float_to_string(weather.feels_like_temp), 290, 176);
-    frame_draw_circle((290 + float_str_width(weather.feels_like_temp, font24.width)), 176, 3);
+    frame_draw_circle((292 + float_str_width(weather.feels_like_temp, font24.width)), 176, 3);
     frame_draw_string(font24, "High: ", 175, 20);
     frame_draw_string(font24, float_to_string(weather.high_temp), 260, 20);
-    frame_draw_circle((260 + float_str_width(weather.high_temp, font24.width)), 20, 3);
+    frame_draw_circle((262 + float_str_width(weather.high_temp, font24.width)), 20, 3);
     frame_draw_string(font24, "Low: ", 175, 50);
     frame_draw_string(font24, float_to_string(weather.low_temp), 260, 50);
-    frame_draw_circle((260 + float_str_width(weather.low_temp, font24.width)), 50, 3);
+    frame_draw_circle((262 + float_str_width(weather.low_temp, font24.width)), 50, 3);
     frame_draw_string(font16, "Wind", 175, 80);
     frame_draw_string(font16, "Speed", 175, 95);
     frame_draw_image(icon_wind, sizeof(icon_wind), 235, 75);
@@ -990,7 +1114,12 @@ static void frame_draw_default()
     frame_draw_image(icon_cloud_small, sizeof(icon_cloud_small), 240, 120);
     frame_draw_string(font24, float_to_string(weather.cloudiness), 295, 130);
     frame_draw_string(font20, "%", (295 + float_str_width(weather.cloudiness, font24.width)), 125);
+
     /* TODO: Quadrant 3: Graph showing temperature and precipitaion chance */
+    /*frame_draw_graph(20, 200, 470, 470, -10.0f, 110.0f,
+            forecast_hourly_temps, sizeof(forecast_hourly_temps) / sizeof(forecast_hourly_temps[0]), 5, "%.0f°",
+            forecast_hourly_precip_chances,
+            sizeof(forecast_hourly_precip_chances) / sizeof(forecast_hourly_precip_chances[0]), 5, "%.0f%%"); */
     /* TODO: Quadrant 4: Forecast for next few days */
 }
 
@@ -1042,6 +1171,54 @@ static void align_time_to_next_minute()
     ulp_minutes = timeinfo.tm_min;
 }
 
+static void test_weather_data()
+{
+    weather.id = 200;
+    weather.current_temp = 72.8f;
+    weather.feels_like_temp = 75.0f;
+    weather.high_temp = 80.0f;
+    weather.low_temp = 65.0f;
+    weather.wind_speed = 15.0f;
+    weather.wind_direction_degrees = 215; // Southeast
+    weather.cloudiness = 75.0f;
+}
+
+static void task_wifi_start(void *pvParameters)
+{
+    wifi_if = wifi_start();
+    xEventGroupSetBits(event_group, WIFI_DONE_BIT);
+    ESP_LOGI("wifi", "Wi-Fi task complete, bit set");
+    vTaskDelete(NULL);
+}
+
+static void task_sntp_sync_time(void *pvParameters)
+{
+    ESP_LOGI("sntp", "Waiting for Wi-Fi to be connected...");
+    xEventGroupWaitBits(event_group, WIFI_DONE_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    sntp_sync_time();
+    xEventGroupSetBits(event_group, SNTP_DONE_BIT);
+    ESP_LOGI("sntp", "SNTP sync task complete, bit set");
+    vTaskDelete(NULL);
+}
+
+static void task_https_get_weather(void *pvParameters)
+{
+    ESP_LOGI("weather", "Waiting for Wi-Fi to be connected...");
+    xEventGroupWaitBits(event_group, WIFI_DONE_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    if (sntp_get_nvs_time())
+    {
+        ESP_LOGI("weather", "Time obtained from NVS, not waiting for SNTP sync");
+    } else {
+        ESP_LOGI("weather", "No time in NVS, waiting for SNTP sync to complete...");
+        xEventGroupWaitBits(event_group, SNTP_DONE_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    }
+    ESP_LOGI("weather", "Finished waiting for dependencies, starting weather data retrieval");
+    https_get_weather();
+    xEventGroupSetBits(event_group, WEATHER_DONE_BIT);
+    ESP_LOGI("weather", "Weather data retrieval complete");
+    vTaskDelete(NULL);
+}
+
 void app_main()
 {
     vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for serial monitor
@@ -1058,31 +1235,42 @@ void app_main()
     }
 
     /* Init ULP so its variables can be accessed and modified from the main CPU */
-    rtc_gpio_init_all();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
-    ulp_set_wakeup_period(0, 10);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
-    ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
+    esp_sleep_source_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
+    {
+        rtc_gpio_init_all();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
+        ulp_set_wakeup_period(0, 10);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
+        ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
+    }
 
-    // TODO: Split these into async tasks to speed them up, this is where the majority of run time is spent
-    // they initially need to run sequentially wifi -> sntp -> https but once time is stored in nvs,
-    // sntp and https can run in parallel after wifi is initialized
-    esp_netif_t *wifi = wifi_start();
-    // TODO: Store and retrieve sntp time in nvs
-    sync_sntp_time();
-    https_get_weather();
-    wifi_stop(wifi);
-    //test_weather_data();
+    event_group = xEventGroupCreate();
+    if (event_group == NULL)
+    {
+        ESP_LOGE("main", "Failed to create event group");
+        return;
+    }
+    xTaskCreate(task_wifi_start, "wifi_start", 4096, NULL, 5, NULL);
+    xTaskCreate(task_sntp_sync_time, "sntp_sync_time", 4096, NULL, 5, NULL);
+    xTaskCreate(task_https_get_weather, "https_get_weather", 65536, NULL, 5, NULL);
 
-    frame_draw_default();
+    xEventGroupWaitBits(event_group, ALL_DONE_BITS, pdFALSE, pdTRUE, portMAX_DELAY);
+    wifi_stop(wifi_if);
+    vEventGroupDelete(event_group);
+    ESP_LOGI("main", "All tasks complete, proceeding to draw frame and enter deep sleep");
+
     epd_init();
+    frame_draw_default();
     epd_write_frame();
+    epd_sleep();
     rtc_gpio_set_low_all();
 
     align_time_to_next_minute();
     ulp_set_wakeup_period(0, (60ULL * 1000ULL * 1000ULL)); // 60 seconds in uS
     ulp_riscv_timer_resume();
+    esp_sleep_enable_timer_wakeup(179ULL * 60ULL * 1000ULL * 1000ULL); // 3 hours in uS
     esp_deep_sleep_start();
 }
