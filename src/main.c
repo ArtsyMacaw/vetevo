@@ -85,8 +85,9 @@ static struct weather_today
     float low_temp;
     float wind_speed;
     uint16_t wind_direction_degrees; // Degrees from north that the wind is coming from
-    float precipitation; // mm of rain/snow in the last hour
     float cloudiness; // % of sky covered by clouds
+    uint64_t sunrise; // Unix timestamps for sunrise/sunset
+    uint64_t sunset;
 } weather;
 
 #define FORECAST_HOURS 12
@@ -96,17 +97,14 @@ static struct hourly_forecast
     float precipitation_chance;
 } hourly_forecast[FORECAST_HOURS];
 
-#define FORECAST_DAYS 5
+#define FORECAST_DAYS 8
 static struct weather_forecast
 {
     uint16_t id;
-    char description[32];
     float high_temp;
     float low_temp;
-    float wind_speed;
     float precipitation_chance;
-    float cloudiness;
-} forecast[FORECAST_DAYS];
+} forecast[FORECAST_DAYS]; // First item is current day, next 7 are forecast for next 7 days
 
 static uint8_t frame[EPD_HEIGHT][EPD_BYTE_WIDTH];
 
@@ -169,6 +167,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
+
+// TODO: defer function to wait 10 minutes and retry
 
 static esp_netif_t *wifi_start()
 {
@@ -245,17 +245,16 @@ static void wifi_stop(esp_netif_t *netif)
 
 static void https_get_weather()
 {
-    // TODO: Compress everything into one http GET request with 3.0 onecall
-    esp_http_client_config_t config =
+    const esp_http_client_config_t config =
     {
         .host = "api.openweathermap.org",
-        .path = "/data/2.5/weather?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&appid=" API_KEY,
+        .path = "/data/3.0/onecall?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&exclude=minutely,alerts&appid=" API_KEY,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .event_handler = http_event_handler,
         .cert_pem = (char *)server_cert_pem_start
     };
     ESP_LOGI("http", "HTTP client configured with host=%s, path=%s", config.host, config.path);
-    ESP_LOGI("http", "Getting todays weather...");
+    ESP_LOGI("http", "Getting weather data...");
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_GET);
@@ -268,19 +267,18 @@ static void https_get_weather()
     int content_length = esp_http_client_fetch_headers(client);
 
     char *buffer = malloc(content_length + 1);
-    assert(buffer != NULL); // malloc shouldn't fail unless there's a memory leak
+    assert(buffer != NULL);
     int read_len = esp_http_client_read(client, buffer, content_length);
     if (read_len >= 0)
     {
         buffer[read_len] = '\0';
-        ESP_LOGV("http", "Received data: %s", buffer);
+        ESP_LOGI("http", "Received data: %s", buffer);
     }
     else
     {
         ESP_LOGE("http", "Failed to read response");
     }
 
-    /* Parse JSON response and populate the weather struct */
     cJSON *json = cJSON_ParseWithLength(buffer, content_length);
     if (json == NULL)
     {
@@ -293,241 +291,86 @@ static void https_get_weather()
     } else {
         /* Assertions are used here because if the API response doesn't match the expected format then
          * it means the API has changed and the code needs to be updated. */
-        cJSON *weather_array = cJSON_GetObjectItem(json, "weather");
+        cJSON *current = cJSON_GetObjectItem(json, "current");
+
+        cJSON *weather_array = cJSON_GetObjectItem(current, "weather");
         assert(cJSON_IsArray(weather_array));
-        // weather is an array but only ever returns one item
         assert(cJSON_GetArraySize(weather_array) > 0);
-        cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0);
-        cJSON *description = cJSON_GetObjectItem(weather_item, "description");
-        if (cJSON_IsString(description))
-        {
-            strncpy(weather.description, description->valuestring, sizeof(weather.description) - 1);
-            weather.description[sizeof(weather.description) - 1] = '\0';
-            ESP_LOGI("weather", "Description: %s", weather.description);
-        }
-        cJSON *id = cJSON_GetObjectItem(weather_item, "id");
-        if (cJSON_IsNumber(id))
-        {
-            weather.id = id->valueint;
-            ESP_LOGI("weather", "Weather ID: %d", weather.id);
-        }
+        cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
+              *description = cJSON_GetObjectItem(weather_item, "description"),
+              *id = cJSON_GetObjectItem(weather_item, "id");
+        assert(cJSON_IsString(description) && cJSON_IsNumber(id));
+        weather.id = id->valueint;
+        strncpy(weather.description, description->valuestring, sizeof(weather.description) - 1);
+        weather.description[sizeof(weather.description) - 1] = '\0';
+        ESP_LOGI("weather", "Current Weather: %s (ID: %d)", weather.description, weather.id);
 
-        cJSON *main = cJSON_GetObjectItem(json, "main");
-        assert(cJSON_IsObject(main));
-        cJSON *temp = cJSON_GetObjectItem(main, "temp");
-        if (cJSON_IsNumber(temp))
-        {
-            weather.current_temp = temp->valuedouble;
-            ESP_LOGI("weather", "Current Temp: %.2f F", weather.current_temp);
-        }
-        cJSON *feels_like = cJSON_GetObjectItem(main, "feels_like");
-        if (cJSON_IsNumber(feels_like))
-        {
-            weather.feels_like_temp = feels_like->valuedouble;
-            ESP_LOGI("weather", "Feels Like Temp: %.2f F", weather.feels_like_temp);
-        }
-        cJSON *temp_min = cJSON_GetObjectItem(main, "temp_min");
-        if (cJSON_IsNumber(temp_min))
-        {
-            weather.low_temp = temp_min->valuedouble;
-            ESP_LOGI("weather", "Low Temp: %.2f F", weather.low_temp);
-        }
-        cJSON *temp_max = cJSON_GetObjectItem(main, "temp_max");
-        if (cJSON_IsNumber(temp_max))
-        {
-            weather.high_temp = temp_max->valuedouble;
-            ESP_LOGI("weather", "High Temp: %.2f F", weather.high_temp);
-        }
+        cJSON *temp = cJSON_GetObjectItem(current, "temp"),
+              *feels_like = cJSON_GetObjectItem(current, "feels_like");
+        assert(cJSON_IsNumber(temp) && cJSON_IsNumber(feels_like));
+        weather.current_temp = temp->valuedouble;
+        weather.feels_like_temp = feels_like->valuedouble;
+        ESP_LOGI("weather", "Current Temp: %.2f F Feels Like: %.2f F",
+                weather.current_temp, weather.feels_like_temp);
 
-        cJSON *wind = cJSON_GetObjectItem(json, "wind");
-        assert(cJSON_IsObject(wind));
-        cJSON *wind_speed = cJSON_GetObjectItem(wind, "speed");
-        if (cJSON_IsNumber(wind_speed))
-        {
-            weather.wind_speed = wind_speed->valuedouble;
-            ESP_LOGI("weather", "Wind Speed: %.2f mph", weather.wind_speed);
-        }
-        cJSON *wind_direction = cJSON_GetObjectItem(wind, "deg");
-        if (cJSON_IsNumber(wind_direction))
-        {
-            weather.wind_direction_degrees = wind_direction->valueint;
-            ESP_LOGI("weather", "Wind Direction: %d degrees", weather.wind_direction_degrees);
-        }
+        cJSON *wind_speed = cJSON_GetObjectItem(current, "wind_speed"),
+              *wind_direction = cJSON_GetObjectItem(current, "wind_deg"),
+              *cloudiness = cJSON_GetObjectItem(current, "clouds");
+        assert(cJSON_IsNumber(wind_speed) && cJSON_IsNumber(wind_direction) && cJSON_IsNumber(cloudiness));
+        weather.wind_speed = wind_speed->valuedouble;
+        weather.wind_direction_degrees = wind_direction->valueint;
+        weather.cloudiness = cloudiness->valuedouble;
+        ESP_LOGI("weather", "Wind Speed: %.2f mph at %d degrees Cloudiness: %.2f%%",
+                weather.wind_speed, weather.wind_direction_degrees, weather.cloudiness);
 
-        cJSON *clouds = cJSON_GetObjectItem(json, "clouds");
-        assert(cJSON_IsObject(clouds));
-        cJSON *cloudiness = cJSON_GetObjectItem(clouds, "all");
-        if (cJSON_IsNumber(cloudiness))
-        {
-            weather.cloudiness = cloudiness->valuedouble;
-            ESP_LOGI("weather", "Cloudiness: %.2f%%", weather.cloudiness);
-        }
+        cJSON *sunrise = cJSON_GetObjectItem(current, "sunrise"),
+              *sunset = cJSON_GetObjectItem(current, "sunset");
+        assert(cJSON_IsNumber(sunrise) && cJSON_IsNumber(sunset));
+        weather.sunrise = sunrise->valuedouble;
+        weather.sunset = sunset->valuedouble;
+        ESP_LOGI("weather", "Sunrise: %lld, Sunset: %lld", weather.sunrise, weather.sunset);
 
-        /* Won't return anything if it hasn't rained in the last hour */
-        cJSON *rain = cJSON_GetObjectItem(json, "rain");
-        if (cJSON_IsObject(rain))
-        {
-            cJSON *rain_1h = cJSON_GetObjectItem(rain, "1h");
-            if (cJSON_IsNumber(rain_1h))
-            {
-                weather.precipitation = rain_1h->valuedouble;
-                ESP_LOGI("weather", "Precipitation (rain) in last hour: %.2f mm", weather.precipitation);
-            }
-        } else {
-            ESP_LOGI("weather", "Not currently raining");
-            weather.precipitation = -1; // Set negative to indicate no precipitation data
-        }
-    }
-    free(buffer);
-    // TODO: cJSON_Delete should free every JSON object under it, but I should check with valgrind
-    cJSON_Delete(json);
-    esp_http_client_close(client);
-
-    config.path = "/data/2.5/forecast?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&appid=" API_KEY;
-    ESP_LOGI("http", "Getting weather forcasts...");
-    client = esp_http_client_init(&config);
-    esp_http_client_set_method(client, HTTP_METHOD_GET);
-    err = esp_http_client_open(client, 0);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE("http", "HTTP GET request failed: %s", esp_err_to_name(err));
-    }
-    content_length = esp_http_client_fetch_headers(client);
-    buffer = malloc(content_length + 1);
-    assert(buffer != NULL);
-    read_len = esp_http_client_read(client, buffer, content_length);
-    if (read_len >= 0)
-    {
-        buffer[read_len] = '\0';
-        ESP_LOGV("http", "Received data: %s", buffer);
-    } else {
-        ESP_LOGE("http", "Failed to read response");
-    }
-
-    /* Parse JSON response and populate the forecast array; data updates every three hours */
-    json = cJSON_ParseWithLength(buffer, content_length);
-    if (json == NULL)
-    {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL)
-        {
-            ESP_LOGE("json", "Error before: %s", error_ptr);
-        }
-    } else {
-        for (int i = 0; i < FORECAST_DAYS; i++)
-        {
-            cJSON *list = cJSON_GetObjectItem(json, "list");
-            assert(cJSON_IsArray(list));
-            cJSON *forecast_item = cJSON_GetArrayItem(list, i);
-            cJSON *main = cJSON_GetObjectItem(forecast_item, "main");
-            assert(cJSON_IsObject(main));
-            cJSON *temp_min = cJSON_GetObjectItem(main, "temp_min");
-            if (cJSON_IsNumber(temp_min))
-            {
-                forecast[i].low_temp = temp_min->valuedouble;
-                ESP_LOGI("forecast", "Day %d Low Temp: %.2f F", i + 1, forecast[i].low_temp);
-            }
-            cJSON *temp_max = cJSON_GetObjectItem(main, "temp_max");
-            if (cJSON_IsNumber(temp_max))
-            {
-                forecast[i].high_temp = temp_max->valuedouble;
-                ESP_LOGI("forecast", "Day %d High Temp: %.2f F", i + 1, forecast[i].high_temp);
-            }
-            cJSON *wind = cJSON_GetObjectItem(forecast_item, "wind");
-            assert(cJSON_IsObject(wind));
-            cJSON *wind_speed = cJSON_GetObjectItem(wind, "speed");
-            if (cJSON_IsNumber(wind_speed))
-            {
-                forecast[i].wind_speed = wind_speed->valuedouble;
-                ESP_LOGI("forecast", "Day %d Wind Speed: %.2f mph", i + 1, forecast[i].wind_speed);
-            }
-            cJSON *clouds = cJSON_GetObjectItem(forecast_item, "clouds");
-            assert(cJSON_IsObject(clouds));
-            cJSON *cloudiness = cJSON_GetObjectItem(clouds, "all");
-            if (cJSON_IsNumber(cloudiness))
-            {
-                forecast[i].cloudiness = cloudiness->valueint;
-                ESP_LOGI("forecast", "Day %d Cloudiness: %d%%", i + 1, forecast[i].cloudiness);
-            }
-            cJSON *precipitation_chance = cJSON_GetObjectItem(forecast_item, "pop");
-            if (cJSON_IsNumber(precipitation_chance))
-            {
-                forecast[i].precipitation_chance = precipitation_chance->valuedouble;
-                ESP_LOGI("forecast", "Day %d Precipitation Chance: %.2f%%", i + 1, forecast[i].precipitation_chance * 100);
-            }
-            cJSON *weather_array = cJSON_GetObjectItem(forecast_item, "weather");
-            assert(cJSON_IsArray(weather_array));
-            assert(cJSON_GetArraySize(weather_array) > 0);
-            cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0);
-            cJSON *description = cJSON_GetObjectItem(weather_item, "description");
-            if (cJSON_IsString(description))
-            {
-                strncpy(forecast[i].description, description->valuestring, sizeof(forecast[i].description) - 1);
-                forecast[i].description[sizeof(forecast[i].description) - 1] = '\0';
-                ESP_LOGI("forecast", "Day %d Description: %s", i + 1, forecast[i].description);
-            }
-            cJSON *id = cJSON_GetObjectItem(weather_item, "id");
-            if (cJSON_IsNumber(id))
-            {
-                forecast[i].id = id->valueint;
-                ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
-            }
-        }
-    }
-
-    free(buffer);
-    cJSON_Delete(json);
-    esp_http_client_close(client);
-
-    config.path = "/data/3.0/onecall?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&exclude=current,minutely,daily,alerts&appid=" API_KEY;
-    ESP_LOGI("http", "Getting hourly forcasts...");
-    client = esp_http_client_init(&config);
-    esp_http_client_set_method(client, HTTP_METHOD_GET);
-    err = esp_http_client_open(client, 0);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE("http", "HTTP GET request failed: %s", esp_err_to_name(err));
-    }
-    content_length = esp_http_client_fetch_headers(client);
-    buffer = malloc(content_length + 1);
-    assert(buffer != NULL);
-    read_len = esp_http_client_read(client, buffer, content_length);
-    if (read_len >= 0)
-    {
-        buffer[read_len] = '\0';
-        ESP_LOGV("http", "Received data: %s", buffer);
-    } else {
-        ESP_LOGE("http", "Failed to read response");
-    }
-
-    /* Parse JSON response and populate the forecast array; data updates every three hours */
-    json = cJSON_ParseWithLength(buffer, content_length);
-    if (json == NULL)
-    {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL)
-        {
-            ESP_LOGE("json", "Error before: %s", error_ptr);
-        }
-    } else {
         cJSON *hourly_array = cJSON_GetObjectItem(json, "hourly");
-        assert(cJSON_IsArray(hourly_array));
+        assert(cJSON_IsArray(hourly_array) && (cJSON_GetArraySize(hourly_array) >= FORECAST_HOURS));
         for (int i = 0; i < FORECAST_HOURS; i++)
         {
-            cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i);
-            cJSON *temp = cJSON_GetObjectItem(hourly_item, "temp");
-            if (cJSON_IsNumber(temp))
-            {
-                hourly_forecast[i].temp = temp->valuedouble;
-                ESP_LOGI("hourly", "Hour %d Temp: %.2f F", i + 1, hourly_forecast[i].temp);
-            }
-            cJSON *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop");
-            if (cJSON_IsNumber(precipitation_chance))
-            {
-                hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
-                ESP_LOGI("hourly", "Hour %d Precipitation Chance: %.2f%%", i + 1, hourly_forecast[i].precipitation_chance * 100);
-            }
+            cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i),
+                  *temp = cJSON_GetObjectItem(hourly_item, "temp"),
+                  *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop");
+            assert(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance));
+            hourly_forecast[i].temp = temp->valuedouble;
+            hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+            ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%%",
+                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100);
         }
+        cJSON *daily_array = cJSON_GetObjectItem(json, "daily");
+        assert(cJSON_IsArray(daily_array) && (cJSON_GetArraySize(daily_array) >= FORECAST_DAYS));
+        for (int i = 0; i < FORECAST_DAYS; i++)
+        {
+            cJSON *forecast_item = cJSON_GetArrayItem(daily_array, i),
+                  *temp = cJSON_GetObjectItem(forecast_item, "temp");
+            assert(cJSON_IsObject(temp));
+
+            cJSON *temp_min = cJSON_GetObjectItem(temp, "min"),
+                  *temp_max = cJSON_GetObjectItem(temp, "max"),
+                  *precipitation_chance = cJSON_GetObjectItem(forecast_item, "pop");
+            assert(cJSON_IsNumber(temp_min) && cJSON_IsNumber(temp_max) && cJSON_IsNumber(precipitation_chance));
+            forecast[i].low_temp = temp_min->valuedouble;
+            forecast[i].high_temp = temp_max->valuedouble;
+            forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+            ESP_LOGI("forecast", "Day %d Low Temp: %.2f F High Temp: %.2f F Precipitation Chance: %.2f%%",
+                    i + 1, forecast[i].low_temp, forecast[i].high_temp, forecast[i].precipitation_chance * 100);
+
+            cJSON *weather_array = cJSON_GetObjectItem(forecast_item, "weather");
+            assert(cJSON_IsArray(weather_array) && (cJSON_GetArraySize(weather_array) > 0));
+            cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
+                  *id = cJSON_GetObjectItem(weather_item, "id");
+            assert(cJSON_IsNumber(id));
+            forecast[i].id = id->valueint;
+            ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
+        }
+        weather.low_temp = forecast[0].low_temp;
+        weather.high_temp = forecast[0].high_temp;
     }
 
     cJSON_Delete(json);
