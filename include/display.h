@@ -10,7 +10,7 @@
 #define DUAL_SPI            0x15
 #define TCON_SETTING        0x60
 #define VCOM_DATA_INTERVAL  0x50
-#define VCM_DC              0x82
+#define VCOM_DC             0x82
 #define TRANSFER_DATA_1     0x10
 #define TRANSFER_DATA_2     0x13
 #define DISPLAY_REFRESH     0x12

@@ -142,6 +142,14 @@ static void epd_wait_until_idle()
     wait_flag = 0;
 }
 
+static const uint8_t
+    lut_20_partial[] = { 0x00, 30, 5, 30, 5, 1 },
+    lut_21_partial[] = { 0x00, 30, 5, 30, 5, 1 },
+    lut_22_partial[] = { 0x5a, 30, 5, 30, 5, 1 },
+    lut_23_partial[] = { 0x84, 30, 5, 30, 5, 1 },
+    lut_24_partial[] = { 0x00, 30, 5, 30, 5, 1 },
+    lut_25_partial[] = { 0x00, 30, 5, 30, 5, 1 };
+
 static void epd_init()
 {
     epd_reset();
@@ -154,15 +162,12 @@ static void epd_init()
 
     spi_write_command(POWER_SETTING);
     spi_write_data(0x07);
-    spi_write_data(0x17);
+    spi_write_data(0x07);
     spi_write_data(0x3f);
     spi_write_data(0x3f);
-
-    spi_write_command(POWER_ON);
-    epd_wait_until_idle();
 
     spi_write_command(PANEL_SETTING);
-    spi_write_data(0x1f);
+    spi_write_data(0x3f);
 
     spi_write_command(RESOLUTION_SETTING);
     spi_write_data(0x03);
@@ -177,15 +182,70 @@ static void epd_init()
     spi_write_data(0x22);
 
     spi_write_command(VCOM_DATA_INTERVAL);
-    spi_write_data(0x18);
+    spi_write_data(0x39);
     spi_write_data(0x07);
 
-    /*
-    spi_write_command(CASCADE_SETTING);
-    spi_write_data(0x02);
-    spi_write_command(FORCE_TEMPERATURE);
-    spi_write_data(0x5a);
-    */
+    spi_write_command(VCOM_DC);
+    spi_write_data(0x26);
+
+    spi_write_command(0x20);
+    for (int i = 0; i < sizeof(lut_20_partial); i++)
+    {
+        spi_write_data(lut_20_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_20_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+
+    spi_write_command(0x21);
+    for (int i = 0; i < sizeof(lut_21_partial); i++)
+    {
+        spi_write_data(lut_21_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_21_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+    spi_write_command(0x22);
+    for (int i = 0; i < sizeof(lut_22_partial); i++)
+    {
+        spi_write_data(lut_22_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_22_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+    spi_write_command(0x23);
+    for (int i = 0; i < sizeof(lut_23_partial); i++)
+    {
+        spi_write_data(lut_23_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_23_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+    spi_write_command(0x24);
+    for (int i = 0; i < sizeof(lut_24_partial); i++)
+    {
+        spi_write_data(lut_24_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_24_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+    spi_write_command(0x25);
+    for (int i = 0; i < sizeof(lut_25_partial); i++)
+    {
+        spi_write_data(lut_25_partial[i]);
+    }
+    for (int i = 0; i < (42 - sizeof(lut_25_partial)); i++)
+    {
+        spi_write_data(0x00);
+    }
+
+    spi_write_command(POWER_ON);
+    epd_wait_until_idle();
 
     epd_started = 1;
 }
@@ -275,28 +335,20 @@ static void epd_write_partial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     spi_write_data(0x00);
 
     spi_write_command(PARTIAL_IN);
-    if (wakeups > 2)
-    {
-        frame_draw_time(old_hours, old_minutes);
-        spi_write_command(TRANSFER_DATA_1);
-        for (int i = 0; i < h; i++)
-        {
-            for (int j = 0; j < (w / 8); j++)
-            {
-                spi_write_data(time[i][j]);
-            }
-        }
-    }
-    old_hours = hours;
-    old_minutes = minutes;
-
-    frame_draw_time(hours, minutes);
-    spi_write_command(TRANSFER_DATA_2);
+    spi_write_command(TRANSFER_DATA_1);
     for (int i = 0; i < h; i++)
     {
         for (int j = 0; j < (w / 8); j++)
         {
             spi_write_data(time[i][j]);
+        }
+    }
+    spi_write_command(TRANSFER_DATA_2);
+    for (int i = 0; i < h; i++)
+    {
+        for (int j = 0; j < (w / 8); j++)
+        {
+            spi_write_data(~time[i][j]);
         }
     }
     spi_write_command(DISPLAY_REFRESH);
@@ -336,22 +388,28 @@ int main()
         ulp_riscv_timer_stop();
         return 0;
     }
-
+    if (hours == 0) // AM <-> PM transition handled by main CPU
+    {
+        ulp_riscv_wakeup_main_processor();
+        ulp_riscv_timer_stop();
+        return 0;
+    }
     launched = 1;
     uint64_t start_time = time_get();
 
-
-    epd_init();
-    epd_write_partial(CLOCK_X, CLOCK_Y, (CHAR_WIDTH * NUM_CHARS), CHAR_HEIGHT);
-    epd_sleep();
     if ((wakeups % 5) == 1)
     {
         epd_full_refresh();
     }
-    rtc_gpio_set_all_low();
 
+    frame_draw_time(hours, minutes);
     minutes = (minutes + 1) % 60; // Increment minutes every wakeup, and roll over to hours after 60
     hours = (hours + (minutes == 0 ? 1 : 0)) % 12; // Increment hours after 60 minutes, and roll over after 12
+
+    epd_init();
+    epd_write_partial(CLOCK_X, CLOCK_Y, (CHAR_WIDTH * NUM_CHARS), CHAR_HEIGHT);
+    epd_sleep();
+    rtc_gpio_set_all_low();
 
     /* Calculate execution time and adjust timer to ensure wakeup occurs at the start of every minute */
     uint64_t end_time = time_get(),
@@ -363,7 +421,7 @@ int main()
 
     if ((wakeups % 10) == 1)
     {
-        delay_ms = 5600 * 17.5 * 1000;
+        delay_ms = 5200 * 17.5 * 1000;
         ulp_riscv_delay_cycles(delay_ms);
     }
 }
