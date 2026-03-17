@@ -36,6 +36,7 @@
 
 // TODO: use espidf heap tracing to check for memory leaks
 // TODO: go through and correctly handle all the ESP_ERROR_CHECKS
+
 /* Main event group */
 static EventGroupHandle_t event_group = NULL;
 #define WIFI_DONE_BIT BIT0
@@ -43,10 +44,27 @@ static EventGroupHandle_t event_group = NULL;
 #define WEATHER_DONE_BIT BIT2
 #define ALL_DONE_BITS (WIFI_DONE_BIT | SNTP_DONE_BIT | WEATHER_DONE_BIT)
 
+/* Error variables and definitions */
+enum error_type
+{
+    WIFI_ERROR    = 0,
+    SNTP_ERROR    = 1,
+    WEATHER_ERROR = 2,
+    EPD_ERROR     = 3,
+    MEMORY_ERROR  = 4,
+    OTHER_ERROR   = 5,
+    ASSERT        = 6,
+    NO_ERROR      = 7
+};
+static RTC_FAST_ATTR enum error_type current_error = NO_ERROR;
+static RTC_FAST_ATTR uint8_t error_count[NO_ERROR] = {0}; // Indexed by error_type enum
+static uint64_t deferred_uS = 0;
+#define MAX_ERROR_COUNT 10
+
 /* Wall clock time */
 static time_t now;
 static struct tm timeinfo;
-#define UPDATE_TIME time(&now); localtime_r(&now, &timeinfo)
+#define UPDATE_TIME do { time(&now); localtime_r(&now, &timeinfo); } while(0)
 
 /* Wifi definitions and variables */
 static EventGroupHandle_t wifi_event_group;
@@ -95,6 +113,7 @@ static struct hourly_forecast
 {
     float temp;
     float precipitation_chance;
+    char time[6];
 } hourly_forecast[FORECAST_HOURS];
 
 #define FORECAST_DAYS 8
@@ -108,16 +127,30 @@ static struct weather_forecast
 
 static uint8_t frame[EPD_HEIGHT][EPD_BYTE_WIDTH];
 
-// TODO: Check esp_err_t return value
+static void error_handler(enum error_type type, const char *message)
+{
+    ESP_LOGE("error", "%s", message);
+    current_error = type;
+    error_count[type]++;
+    if (error_count[type] >= MAX_ERROR_COUNT || type == ASSERT)
+    {
+        // TODO: Show error on display and halt
+    }
+    deferred_uS = (5ULL * 1000ULL * 1000ULL) << error_count[type]; // Exponential backoff, up to ~1.5 hours
+    esp_sleep_enable_timer_wakeup(deferred_uS);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_deep_sleep_try_to_start());
+}
+
+static void error_esp(enum error_type type, esp_err_t err);
+static void error_check(bool condition, enum error_type type, const char *message);
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    /* Most of these events should never happen, but I'm including them
-     * for completeness and debugging purposes */
     switch (evt->event_id)
     {
         case HTTP_EVENT_ERROR:
             ESP_LOGI("http", "HTTP_EVENT_ERROR");
-            break;
+            return ESP_FAIL;
         case HTTP_EVENT_ON_CONNECTED:
             ESP_LOGI("http", "HTTP_EVENT_ON_CONNECTED");
             break;
@@ -168,12 +201,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// TODO: defer function to wait 10 minutes and retry
-
 static esp_netif_t *wifi_start()
 {
-    // TODO: If ESP_ERROR returns an error restart the board and try again.
-    // preferably the ULP should continue to update the time on the display
     /* Default event loop must be created before create_default_wifi_sta() is called */
     wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
@@ -200,8 +229,10 @@ static esp_netif_t *wifi_start()
                                                                 &instance_got_ip));
 
     /* Configure Wi-Fi connection and start the interface */
-    wifi_config_t wifi_config = {
-        .sta = {
+    wifi_config_t wifi_config =
+    {
+        .sta =
+        {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD
         }
@@ -225,12 +256,11 @@ static esp_netif_t *wifi_start()
     {
         ESP_LOGI("wifi", "Connected to AP");
     }
-    // TODO: Need to handle failure eventually and retry after 10 minutes
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI("wifi", "Failed to connect to AP");
+        error_handler(WIFI_ERROR, "Failed to connect to Wi-Fi");
     } else {
-        ESP_LOGE("wifi", "UNEXPECTED EVENT");
+        error_handler(WIFI_ERROR, "Unexpected event while connecting to Wi-Fi");
     }
 
     return wifi;
@@ -261,10 +291,13 @@ static void https_get_weather()
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK)
     {
-        ESP_LOGE("http", "HTTP GET request failed: %s", esp_err_to_name(err));
-        // TODO: Schedule retry after 10 minutes
+        error_handler(WEATHER_ERROR, "Failed to open HTTP connection");
     }
     int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0)
+    {
+        error_handler(WEATHER_ERROR, "Failed to fetch HTTP headers");
+    }
 
     char *buffer = malloc(content_length + 1);
     assert(buffer != NULL);
@@ -272,21 +305,20 @@ static void https_get_weather()
     if (read_len >= 0)
     {
         buffer[read_len] = '\0';
-        ESP_LOGI("http", "Received data: %s", buffer);
+        ESP_LOGV("http", "Received data: %s", buffer);
     }
     else
     {
-        ESP_LOGE("http", "Failed to read response");
+        error_handler(WEATHER_ERROR, "Failed to read HTTP response");
     }
 
     cJSON *json = cJSON_ParseWithLength(buffer, content_length);
     if (json == NULL)
     {
-        // TODO: Schedule retry after 10 minutes
         const char *error_ptr = cJSON_GetErrorPtr();
         if (error_ptr != NULL)
         {
-            ESP_LOGE("json", "Error before: %s", error_ptr);
+            error_handler(WEATHER_ERROR, error_ptr);
         }
     } else {
         /* Assertions are used here because if the API response doesn't match the expected format then
@@ -301,8 +333,7 @@ static void https_get_weather()
               *id = cJSON_GetObjectItem(weather_item, "id");
         assert(cJSON_IsString(description) && cJSON_IsNumber(id));
         weather.id = id->valueint;
-        strncpy(weather.description, description->valuestring, sizeof(weather.description) - 1);
-        weather.description[sizeof(weather.description) - 1] = '\0';
+        snprintf(weather.description, sizeof(weather.description), "%s", description->valuestring);
         ESP_LOGI("weather", "Current Weather: %s (ID: %d)", weather.description, weather.id);
 
         cJSON *temp = cJSON_GetObjectItem(current, "temp"),
@@ -336,12 +367,19 @@ static void https_get_weather()
         {
             cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i),
                   *temp = cJSON_GetObjectItem(hourly_item, "temp"),
-                  *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop");
-            assert(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance));
+                  *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop"),
+                  *dt = cJSON_GetObjectItem(hourly_item, "dt");
+            assert(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance) && cJSON_IsNumber(dt));
             hourly_forecast[i].temp = temp->valuedouble;
             hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
-            ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%%",
-                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100);
+            time_t dt_time_t = (time_t)dt->valuedouble;
+            ESP_LOGI("hourly", "Raw time for hour %d: %lld", i + 1, dt_time_t);
+            struct tm dt_timeinfo;
+            localtime_r(&dt_time_t, &dt_timeinfo);
+            strftime(hourly_forecast[i].time, sizeof(hourly_forecast[i].time), "%I%p", &dt_timeinfo);
+            ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%% at %s",
+                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100,
+                    hourly_forecast[i].time);
         }
         cJSON *daily_array = cJSON_GetObjectItem(json, "daily");
         assert(cJSON_IsArray(daily_array) && (cJSON_GetArraySize(daily_array) >= FORECAST_DAYS));
@@ -416,7 +454,7 @@ static void sntp_sync_time()
 
     if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK)
     {
-        ESP_LOGE("sntp", "Failed to synchronize time");
+        error_handler(SNTP_ERROR, "Failed to synchronize time with SNTP server");
     } else {
         ESP_LOGI("sntp", "Time synchronized successfully");
     }
@@ -577,32 +615,55 @@ static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
     }
 }
 
-static void frame_draw_char(font_t font, char c, int x, int y)
+static void frame_draw_char(int x, int y, font_t font, char c)
 {
-    uint8_t bytes_per_char = (font.width / BITS_PER_BYTE) + (font.width % BITS_PER_BYTE != 0);
+    const uint8_t bytes_per_char = (font.width / BITS_PER_BYTE) + (font.width % BITS_PER_BYTE != 0);
 
     /* Subtract the first character in the font from the character to get the index,
      * then multiply by the number of bytes per character to get the offset in the font data array */
-    size_t offset = (c - ' ') * font.height * bytes_per_char;
+    const size_t offset = (c - ' ') * font.height * bytes_per_char;
     const uint8_t *char_start = font.table + offset;
-
-    /* Convert the 1D font data array for the character into a 2D array
-     * for easier indexing when drawing to the frame buffer. */
-    uint8_t char_2d[font.height][bytes_per_char];
-    memcpy(char_2d, char_start, sizeof(char_2d));
 
     for (int i = 0; i < font.height; i++)
     {
         for (int j = 0; j < bytes_per_char; j++)
         {
-            frame_draw_byte((x + (j * BITS_PER_BYTE)), (y + i), char_2d[i][j]);
+            frame_draw_byte((x + (j * BITS_PER_BYTE)), (y + i), char_start[i * bytes_per_char + j]);
         }
     }
 }
 
-static void frame_draw_giant_char(uint32_t offset, int x, int y)
+static void frame_draw_rotated_char(int x, int y, font_t font, char c)
 {
-    uint8_t bytes_per_char = (font60.width / BITS_PER_BYTE) + (font60.width % BITS_PER_BYTE != 0);
+    const uint8_t bytes_per_char = (font.width / BITS_PER_BYTE) + (font.width % BITS_PER_BYTE != 0);
+    const size_t offset = (c - ' ') * font.height * bytes_per_char;
+    const uint8_t *char_start = font.table + offset;
+    const uint8_t bytes_per_row_rot = (font.height / BITS_PER_BYTE) + (font.height % BITS_PER_BYTE != 0);
+
+    for (int i = 0; i < font.width; i++)
+    {
+        for (int j = 0; j < bytes_per_row_rot; j++)
+        {
+            uint8_t rotated_byte = 0;
+            for (int k = 0; k < BITS_PER_BYTE; k++)
+            {
+                int new_col = (j * BITS_PER_BYTE) + k,
+                    old_row = (font.height - 1) - new_col,
+                    old_col = i;
+                if (new_col >= font.height) { break; }
+
+                const uint8_t src_byte = char_start[old_row * bytes_per_char + old_col / BITS_PER_BYTE];
+                const uint8_t bit = (src_byte >> (BITS_PER_BYTE - 1 - (old_col % BITS_PER_BYTE))) & 1u;
+                rotated_byte |= bit << (BITS_PER_BYTE - 1 - k);
+            }
+            frame_draw_byte((x + (j * BITS_PER_BYTE)), (y + i), rotated_byte);
+        }
+    }
+}
+
+static void frame_draw_giant_char(int x, int y, uint32_t offset)
+{
+    const uint8_t bytes_per_char = (font60.width / BITS_PER_BYTE) + (font60.width % BITS_PER_BYTE != 0);
     const uint8_t *char_start = font60.table + offset;
 
     for (int i = 0; i < font60.height; i++)
@@ -614,19 +675,31 @@ static void frame_draw_giant_char(uint32_t offset, int x, int y)
     }
 }
 
-static void frame_draw_string(font_t font, const char *str, int x, int y)
+static void frame_draw_rotated_string(int x, int y, font_t font, const char *str)
+{
+    while (str[0] != '\0')
+    {
+        /* Slightly cursed code to make periods look better */
+        y -= (str[0] == '.' && font.width < 20) ? ((font.width / 2) - 1) : 0;
+        frame_draw_rotated_char(x, y, font, *str);
+        y += (str[0] != '.') ? font.width : ((font.width / 2) + 2);
+        str++;
+    }
+}
+
+static void frame_draw_string(int x, int y, font_t font, const char *str)
 {
     while (str[0] != '\0')
     {
         /* Slightly cursed code to make periods look better */
         x -= (str[0] == '.' && font.width < 20) ? ((font.width / 2) - 1) : 0;
-        frame_draw_char(font, *str, x, y);
+        frame_draw_char(x, y, font, *str);
         x += (str[0] != '.') ? font.width : ((font.width / 2) + 2);
         str++;
     }
 }
 
-static void frame_draw_image(const uint8_t *image_data, size_t length, int x, int y)
+static void frame_draw_image(int x, int y, const uint8_t *image_data, size_t length)
 {
     int height = (length == 1545) ? 103 : 40,
         width = (length == 1545) ? 120 : 48;
@@ -664,70 +737,120 @@ static void frame_draw_circle(int center_x, int center_y, int radius)
     }
 }
 
-/* Bresenham's line algorithm, Used to draw arrows */
-static void frame_draw_line(int x0, int y0, int x1, int y1)
+/* Bresenham Line Drawing Algorithm */
+static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
 {
-    int dx = abs(x1 - x0),
-        sx = (x0 < x1) ? 1 : -1,
-        dy = -abs(y1 - y0),
-        sy = (y0 < y1) ? 1 : -1,
+    int dx  = abs(x1 - x0),
+        sx  = x0 < x1 ? 1 : -1,
+        dy  = -abs(y1 - y0),
+        sy  = y0 < y1 ? 1 : -1,
         err = dx + dy,
-        e2; // error value e_xy
-    while (1)
+        e2;
+    bool straight_line = (dx == 0 || dy == 0);
+    if (straight_line)
     {
-        frame_draw_byte(x0, y0, 0xc0);
-        if (x0 == x1 && y0 == y1) break;
-        e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+        if (dy == 0)
+        {
+            if (thickness == 1)
+            {
+                while (x0 != x1)
+                {
+                    frame_draw_byte(x0, y0, 0x80);
+                    x0 += sx;
+                }
+            } else {
+                for (int i = 0; i < thickness; i++)
+                {
+                    /* Recusrively draw lines on either side of the original line to create thickness,
+                     * alternating sides to keep it centered */
+                    int8_t flip = (i % 2 == 0) ? ((i / 2) * - 1) : ((i + 1) / 2);
+                    frame_draw_line(x0, y0 + flip, x1, y1 + flip, 1);
+                }
+            }
+        } else {
+            while (y0 != y1)
+            {
+                uint8_t byte = (uint8_t)(0xFF00 >> thickness);
+                frame_draw_byte(x0, y0, byte);
+                y0 += sy;
+            }
+        }
+    }
+    else if (thickness > 1)
+    {
+        for (int i = 0; i < thickness; i++)
+        {
+            int8_t flip = (i % 2 == 0) ? ((i / 2) * - 1) : ((i + 1) / 2);
+            frame_draw_line(x0, y0 + flip, x1, y1 + flip, 1);
+        }
+
+    } else {
+        while (true)
+        {
+            frame_draw_byte(x0, y0, 0xc0);
+            if (x0 == x1 && y0 == y1) break;
+            e2 = 2 * err;
+            if (e2 >= dy)
+            {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx)
+            {
+                err += dx;
+                y0 += sy;
+            }
+        }
     }
 }
 
 /* Draws a rectangle with an x in the middle of it */
-static void frame_draw_x_rectangle(int x0, int y0, int x1, int y1)
+static void frame_draw_dotted_rectangle(int left, int top, int right, int bottom, int thickness)
 {
-    for (int x = x0; x <= x1; x++)
+    frame_draw_line(left, top, left, bottom, thickness);
+    frame_draw_line(right, top, right, bottom, thickness);
+    frame_draw_line(left, top, right, top, thickness);
+    frame_draw_line(left, bottom, right, bottom, thickness);
+    for (int i = top; i <= bottom; i += 4)
     {
-        frame_draw_byte(x, y0, 0x03);
-        frame_draw_byte(x, y1, 0x03);
+        int middle = (left + right) / 2;
+        if (frame[i][middle / BITS_PER_BYTE] == 0x00 &&
+                frame[i + 1][middle / BITS_PER_BYTE] == 0x00 &&
+                frame[i - 1][middle / BITS_PER_BYTE] == 0x00)
+        {
+            frame_draw_line(left, i, right, i, thickness);
+        } else {
+            i -= 3; // Skip the next two lines to create a gap in the dotted line
+        }
     }
-    for (int y = y0; y <= y1; y++)
-    {
-        frame_draw_byte(x0, y, 0x03);
-        frame_draw_byte(x1, y, 0x03);
-    }
-    frame_draw_line(x0, y0, x1, y1);
-    frame_draw_line(x0, y1, x1, y0);
 }
 
 static void frame_draw_filled_triangle(int x0, int y0, int x1, int y1, int x2, int y2)
 {
-    frame_draw_line(x0, y0, x1, y1);
-    frame_draw_line(x1, y1, x2, y2);
-    frame_draw_line(x2, y2, x0, y0);
-
-    int t;
-    if (y0 > y1) { t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
-    if (y0 > y2) { t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t; }
-    if (y1 > y2) { t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
+    /* Sort the vertices by y-coordinate ascending (y0 <= y1 <= y2) */
+    if (y0 > y1) { int t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    if (y0 > y2) { int t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t; }
+    if (y1 > y2) { int t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
     int total_h = y2 - y0;
 
+    /* Scanline algorithm */
     for (int y = y0; y <= y2; y++)
     {
-        int xa = (int)(x0 + (double)(x2 - x0) * (y - y0) / total_h);
-        int xb;
+        double xa = (x0 + (double)(x2 - x0) * (y - y0) / total_h),
+               xb;
         if (y <= y1)
         {
             int seg = y1 - y0;
-            xb = (seg == 0) ? x0 : (int)(x0 + (double)(x1 - x0) * (y - y0) / seg);
+            xb = (seg == 0) ? x0 : (x0 + (double)(x1 - x0) * (y - y0) / seg);
         } else {
             int seg = y2 - y1;
-            xb = (seg == 0) ? x1 : (int)(x1 + (double)(x2 - x1) * (y - y1) / seg);
+            xb = (seg == 0) ? x1 : (x1 + (double)(x2 - x1) * (y - y1) / seg);
         }
-        if (xa > xb) { t = xa; xa = xb; xb = t; }
-
-        int remaining = xb - xa + 1,
-            x = xa;
+        if (xa > xb) { double tmp = xa; xa = xb; xb = tmp; }
+        int ixa = (int)ceil(xa),
+            ixb = (int)floor(xb),
+            remaining = ixb - ixa + 1,
+            x = ixa;
         while (remaining > 0)
         {
             int bits = (remaining > 8) ? 8 : remaining;
@@ -739,12 +862,10 @@ static void frame_draw_filled_triangle(int x0, int y0, int x1, int y1, int x2, i
     }
 }
 
-static void frame_draw_compass(int x, int y, uint16_t degrees, int length)
+static void frame_draw_arrow(int x, int y, uint16_t degrees, int length)
 {
     /* Convert degrees to radians and adjust so 0 degrees is pointing up */
     float radians = degrees * (M_PI / 180.0f);
-    /* Draw a circle for the compass background */
-    frame_draw_circle(x, y, length);
     /* Screen space unit vector in the direction of the wind */
     double dx      = sin(radians),
            dy      = -cos(radians),
@@ -752,36 +873,42 @@ static void frame_draw_compass(int x, int y, uint16_t degrees, int length)
            px      = dy,
            py      = -dx,
     /* Coordinates where the arrowhead is attached to the line */
-           base_cx = x + 0.35 * length * dx,
-           base_cy = y + 0.35 * length * dy;
+           base_cx = x + 0.50 * length * dx,
+           base_cy = y + 0.50 * length * dy;
     /* Second set of coordinates for the line of the arrow */
-    int    edge_x  = (int)round(x + length * dx),
-           edge_y  = (int)round(y + length * dy),
+    int    edge_x  = (int)(x + length * dx),
+           edge_y  = (int)(y + length * dy),
     /* Coordinates for the tip of the arrow */
-           tip_x   = (int)round(x + 0.80 * length * dx),
-           tip_y   = (int)round(y + 0.80 * length * dy),
+           tip_x   = (int)(x + 1 * length * dx),
+           tip_y   = (int)(y + 1 * length * dy),
     /* Coordinates for two sides of the triangle for the arrowhead, using the perpendicular vector */
            b1x     = (int)round(base_cx + 0.30 * length * px),
            b1y     = (int)round(base_cy + 0.30 * length * py),
            b2x     = (int)round(base_cx - 0.30 * length * px),
            b2y     = (int)round(base_cy - 0.30 * length * py);
-    frame_draw_line(x, y, edge_x, edge_y);
+    frame_draw_line(x, y, edge_x, edge_y, 2);
     frame_draw_filled_triangle(tip_x, tip_y, b1x, b1y, b2x, b2y);
-
-    /* Draw N, E, S, W indicators */
-    frame_draw_char(font16, 'N', x - (font16.width / 2), y - length - font16.height);
-    frame_draw_char(font16, 'E', x + length + 4, y - (font16.height / 2));
-    frame_draw_char(font16, 'S', x - (font16.width / 2) + 2, y + length + 2);
-    frame_draw_char(font16, 'W', x - length - font16.width - 2, y - (font16.height / 2));
 }
 
-static void frame_draw_time(uint16_t x, uint16_t y)
+static void frame_draw_compass(int x, int y, uint16_t degrees, int length)
+{
+    /* Draw a circle for the compass background */
+    frame_draw_circle(x, y, length);
+    /* Draw arrow in the direction of the wind */
+    frame_draw_arrow(x, y, degrees, length);
+    /* Draw N, E, S, W indicators */
+    frame_draw_char(x - (font16.width / 2), y - length - font16.height, font16, 'N');
+    frame_draw_char(x + length + 4, y - (font16.height / 2), font16, 'E');
+    frame_draw_char(x - (font16.width / 2) + 2, y + length + 2, font16, 'S');
+    frame_draw_char(x - length - font16.width - 2, y - (font16.height / 2), font16, 'W');
+}
+
+static void frame_draw_time(int x, int y)
 {
     UPDATE_TIME;
-    uint16_t hour = timeinfo.tm_hour % 12,
+    uint16_t hour = ((timeinfo.tm_hour % 12) == 0) ? 12 : (timeinfo.tm_hour % 12),
              minute = timeinfo.tm_min,
              afternoon = (timeinfo.tm_hour >= 12) ? 0 : 1;
-    hour = (hour == 0) ? 12 : hour; // Convert 0 to 12 for 12-hour format
     ESP_LOGI("time", "Current time: %02d:%02d %s", (hour == 0) ? 12 : hour, minute, afternoon ? "AM" : "PM");
 
     uint8_t time[] =
@@ -799,20 +926,20 @@ static void frame_draw_time(uint16_t x, uint16_t y)
     {
         switch (time[i])
         {
-            case 0:  frame_draw_giant_char(ZERO,     x + (i * font60.width), y); break;
-            case 1:  frame_draw_giant_char(ONE,      x + (i * font60.width), y); break;
-            case 2:  frame_draw_giant_char(TWO,      x + (i * font60.width), y); break;
-            case 3:  frame_draw_giant_char(THREE,    x + (i * font60.width), y); break;
-            case 4:  frame_draw_giant_char(FOUR,     x + (i * font60.width), y); break;
-            case 5:  frame_draw_giant_char(FIVE,     x + (i * font60.width), y); break;
-            case 6:  frame_draw_giant_char(SIX,      x + (i * font60.width), y); break;
-            case 7:  frame_draw_giant_char(SEVEN,    x + (i * font60.width), y); break;
-            case 8:  frame_draw_giant_char(EIGHT,    x + (i * font60.width), y); break;
-            case 9:  frame_draw_giant_char(NINE,     x + (i * font60.width), y); break;
-            case 10: frame_draw_giant_char(COLON,    x + (i * font60.width), y); break;
-            case 11: frame_draw_giant_char(LETTER_A, x + (i * font60.width), y); break;
-            case 12: frame_draw_giant_char(LETTER_P, x + (i * font60.width), y); break;
-            case 13: frame_draw_giant_char(LETTER_M, x + (i * font60.width), y); break;
+            case 0:  frame_draw_giant_char(x + (i * font60.width), y, ZERO); break;
+            case 1:  frame_draw_giant_char(x + (i * font60.width), y, ONE); break;
+            case 2:  frame_draw_giant_char(x + (i * font60.width), y, TWO); break;
+            case 3:  frame_draw_giant_char(x + (i * font60.width), y, THREE); break;
+            case 4:  frame_draw_giant_char(x + (i * font60.width), y, FOUR); break;
+            case 5:  frame_draw_giant_char(x + (i * font60.width), y, FIVE); break;
+            case 6:  frame_draw_giant_char(x + (i * font60.width), y, SIX); break;
+            case 7:  frame_draw_giant_char(x + (i * font60.width), y, SEVEN); break;
+            case 8:  frame_draw_giant_char(x + (i * font60.width), y, EIGHT); break;
+            case 9:  frame_draw_giant_char(x + (i * font60.width), y, NINE); break;
+            case 10: frame_draw_giant_char(x + (i * font60.width), y, COLON); break;
+            case 11: frame_draw_giant_char(x + (i * font60.width), y, LETTER_A); break;
+            case 12: frame_draw_giant_char(x + (i * font60.width), y, LETTER_P); break;
+            case 13: frame_draw_giant_char(x + (i * font60.width), y, LETTER_M); break;
         }
     }
 }
@@ -822,76 +949,89 @@ static void frame_draw_icon(int x, int y, uint16_t weather_id)
     /* Weather condition codes documented at https://openweathermap.org/weather-conditions */
     if (weather_id >= THUNDERSTORM_START && weather_id < DRIZZLE_START)
     {
-        frame_draw_image(icon_thunder, sizeof(icon_thunder), x, y);
+        frame_draw_image(x, y, icon_thunder, sizeof(icon_thunder));
     }
     else if (weather_id >= DRIZZLE_START && weather_id < RAIN_START)
     {
-        frame_draw_image(icon_drizzle, sizeof(icon_drizzle), x, y);
+        frame_draw_image(x, y, icon_drizzle, sizeof(icon_drizzle));
     }
     else if (weather_id >= RAIN_START && weather_id < SNOW_START)
     {
-        frame_draw_image(icon_rain, sizeof(icon_rain), x, y);
+        frame_draw_image(x, y, icon_rain, sizeof(icon_rain));
     }
     else if (weather_id >= SNOW_START && weather_id < ATMOSPHERE_START)
     {
-        frame_draw_image(icon_snow, sizeof(icon_snow), x, y);
+        frame_draw_image(x, y, icon_snow, sizeof(icon_snow));
     }
     else if (weather_id >= ATMOSPHERE_START && weather_id < CLEAR_SKY)
     {
-        frame_draw_image(icon_haze, sizeof(icon_haze), x, y);
+        frame_draw_image(x, y, icon_haze, sizeof(icon_haze));
     }
     else if (weather_id == CLEAR_SKY)
     {
-        frame_draw_image(icon_sun, sizeof(icon_sun), x, y);
+        frame_draw_image(x, y, icon_sun, sizeof(icon_sun));
     } else {
-        frame_draw_image(icon_cloud, sizeof(icon_cloud), x, y);
+        frame_draw_image(x, y, icon_cloud, sizeof(icon_cloud));
     }
 }
 
-/* Draw graph of two sets of points with different y-axes, used for the temperature and precipitation forecast graph
+/* Draw graph of two sets of points with the same y-axes, used for the temperature and precipitation forecast graph
  * first series of points is drawn with a solid line and the second series is drawn with as dashed boxes */
-static void frame_draw_graph(int x1, int y1, int x2, int y2, float min_value, float max_value,
-        const float *points, size_t num_points, int num_y_labels, const char *y_label_format,
-        const float *points2, size_t num_points2, int num_y_labels2, const char *y_label_format2)
+static void frame_draw_graph(int left, int top, int right, int bottom, float min_value, float max_value,
+        struct hourly_forecast hourly_forecast[], int num_points, int num_lines_y, const char *left_label_format,
+        const char *right_label_format)
 {
-    /* Draw one base line for x axis and two base lines for the y axes */
-    frame_draw_line(x1, y2, x2, y2);
-    frame_draw_line(x1, y1, x1, y2);
-    frame_draw_line(x2, y1, x2, y2);
-    /* Draw labels for y axes */
-    for (int i = 0; i < num_y_labels; i++)
+    /* |_| shaped graph */
+    frame_draw_line(left, top, left, bottom + 1, 2);
+    frame_draw_line(left, bottom, right, bottom, 2);
+    frame_draw_line(right, top, right, bottom + 2, 2);
+
+    /* Y axis increases as you go down the screen */
+    int    graph_width       = abs(right - left),
+           graph_height      = abs(bottom - top),
+           x_space           = graph_width / (num_points - 1),
+           x_error           = graph_width - (x_space * (num_points - 1)),
+           y_spacing         = graph_height / num_lines_y;
+    double conversion_factor = graph_height / (max_value - min_value);
+
+    for (int i = 0; i < num_points; i++)
     {
-        float value = min_value + i * (max_value - min_value) / (num_y_labels - 1);
+        int x = (i < (num_points - 1)) ? (x_space * i) + left : (x_space * i) + x_error + left;
+        frame_draw_line(x, bottom, x, top, 1);
+        frame_draw_rotated_string(x - 8, bottom + 8, font12, hourly_forecast[i].time);
+    }
+
+    for (int i = 0; i <= num_lines_y; i++)
+    {
+        float label_value = min_value + ((max_value - min_value) / num_lines_y) * i;
+        int y = bottom - (i * y_spacing);
         char label[16];
-        snprintf(label, sizeof(label), y_label_format, value);
-        frame_draw_string(font16, label,
-                x1 - (font16.width * strlen(label)) - 5,
-                y2 - ((y2 - y1) * i / (num_y_labels - 1)) - (font16.height / 2));
+
+        frame_draw_line(left, y, right, y, 1);
+
+        snprintf(label, sizeof(label), left_label_format, label_value);
+        frame_draw_string(left - (font12.width * strlen(label)) - 14, y - 6, font12, label);
+        frame_draw_circle(left - 12, y - 8, 2);
+
+        snprintf(label, sizeof(label), right_label_format, label_value);
+        frame_draw_string(right + 4, y - 6, font12, label);
     }
-    for (int i = 0; i < num_y_labels2; i++)
+
+    for (int i = 1; i < num_points; i++)
     {
-        float value = min_value + i * (max_value - min_value) / (num_y_labels2 - 1);
-        char label[16];
-        snprintf(label, sizeof(label), y_label_format2, value);
-        frame_draw_string(font16, label,
-                x2 + 5,
-                y2 - ((y2 - y1) * i / (num_y_labels2 - 1)) - (font16.height / 2));
-    }
-    /* Draw points and lines for first series */
-    for (size_t i = 0; i < num_points - 1; i++)
-    {
-        int x_start = x1 + (i * (x2 - x1) / (num_points - 1)),
-            y_start = y2 - ((points[i] - min_value) * (y2 - y1) / (max_value - min_value)),
-            x_end = x1 + ((i + 1) * (x2 - x1) / (num_points - 1)),
-            y_end = y2 - ((points[i + 1] - min_value) * (y2 - y1) / (max_value - min_value));
-        frame_draw_line(x_start, y_start, x_end, y_end);
-    }
-    /* Draw points for second series as dashed boxes */
-    for (size_t i = 0; i < num_points2; i++)
-    {
-        int x_center = x1 + (i * (x2 - x1) / (num_points2 - 1)),
-            y_center = y2 - ((points2[i] - min_value) * (y2 - y1) / (max_value - min_value));
-        frame_draw_x_rectangle(x_center - 3, y_center - 3, x_center + 3, y_center + 3);
+        int temp_y      = (int)bottom - round((hourly_forecast[i].temp - min_value) * conversion_factor),
+            temp_y_prev = (int)(bottom - round((hourly_forecast[i - 1].temp - min_value) * conversion_factor)),
+            precip_y    =
+                (int)(bottom - round((hourly_forecast[i].precipitation_chance - min_value) * conversion_factor)),
+            x           = (i < (num_points - 1)) ? (x_space * i) + left : (x_space * i) + x_error + left,
+            x_prev      = (x_space * (i - 1)) + left;
+
+        frame_draw_line(x_prev, temp_y_prev, x, temp_y, 3);
+
+        if (precip_y < bottom)
+        {
+            frame_draw_dotted_rectangle(x_prev, precip_y, x, bottom, 1);
+        }
     }
 }
 
@@ -910,12 +1050,12 @@ static char *float_to_string(float value)
 static uint16_t float_str_width(float value, uint16_t font_width)
 {
     char *str = float_to_string(value);
-    float str_width = strlen(str) * font_width;
+    uint16_t str_width = strlen(str) * font_width;
     if (font_width <= 22)
     {
         str_width -= (strchr(str, '.') != NULL) ? font_width : 0;
     } else {
-        str_width -= (strchr(str, '.') != NULL) ? (font_width / 2) : 0;
+        str_width -= (strchr(str, '.') != NULL) ? (font_width * 0.35) : 0;
     }
     return str_width;
 }
@@ -925,50 +1065,50 @@ static void frame_draw_default()
     /* Quadrant 1: Current time and date */
     UPDATE_TIME;
     char timeinfo_str[64];
-    frame_draw_string(font24, "It is ", 450, 20);
+    frame_draw_string(450, 20, font24, "It is ");
     strftime(timeinfo_str, sizeof(timeinfo_str), "%A,", &timeinfo);
-    frame_draw_string(font24, timeinfo_str, (font24.width * strlen("It is ")) + 450, 20);
+    frame_draw_string(450 + (font24.width * strlen("It is ")), 20, font24, timeinfo_str);
     strftime(timeinfo_str, sizeof(timeinfo_str), "%B %d, %Y", &timeinfo);
-    frame_draw_string(font24, timeinfo_str, 470, 50);
+    frame_draw_string(470, 50, font24, timeinfo_str);
     frame_draw_time(CLOCK_X, CLOCK_Y);
 
     /* Quadrant 2: Current weather conditions */
     frame_draw_icon(20, 20, weather.id);
-    frame_draw_string(font20, "Currently, ", 10, 130);
-    frame_draw_string(font40, float_to_string(weather.current_temp), 30, 160);
-    frame_draw_circle((30 + float_str_width(weather.current_temp, font40.width)), 165, 5);
-    frame_draw_string(font20, "feels like", 140, 180);
-    frame_draw_string(font24, float_to_string(weather.feels_like_temp), 290, 176);
+    frame_draw_string(10, 130, font20, "Currently, ");
+    frame_draw_string(30, 160, font40, float_to_string(weather.current_temp));
+    frame_draw_circle(30 + float_str_width(weather.current_temp, font40.width), 165, 5);
+    frame_draw_string(140, 180, font20, "feels like");
+    frame_draw_string(290, 176, font24, float_to_string(weather.feels_like_temp));
     frame_draw_circle((292 + float_str_width(weather.feels_like_temp, font24.width)), 176, 3);
-    frame_draw_string(font24, "High: ", 175, 20);
-    frame_draw_string(font24, float_to_string(weather.high_temp), 260, 20);
+    frame_draw_string(175, 20, font24, "High");
+    frame_draw_arrow(185 + (4 * font24.width), 40, 0, 20);
+    frame_draw_string(260, 20, font24, float_to_string(weather.high_temp));
     frame_draw_circle((262 + float_str_width(weather.high_temp, font24.width)), 20, 3);
-    frame_draw_string(font24, "Low: ", 175, 50);
-    frame_draw_string(font24, float_to_string(weather.low_temp), 260, 50);
+    frame_draw_string(175, 50, font24, " Low");
+    frame_draw_arrow(185 + (4 * font24.width), 50, 180, 20);
+    frame_draw_string(260, 50, font24, float_to_string(weather.low_temp));
     frame_draw_circle((262 + float_str_width(weather.low_temp, font24.width)), 50, 3);
-    frame_draw_string(font16, "Wind", 175, 80);
-    frame_draw_string(font16, "Speed", 175, 95);
-    frame_draw_image(icon_wind, sizeof(icon_wind), 235, 75);
-    frame_draw_string(font24, float_to_string(weather.wind_speed), 285, 85);
-    frame_draw_string(font16, "mph", (285 + float_str_width(weather.wind_speed, font24.width)), 90);
+    frame_draw_string(175, 80, font16, "Wind");
+    frame_draw_string(175, 95, font16, "Speed");
+    frame_draw_image(235, 75, icon_wind, sizeof(icon_wind));
+    frame_draw_string(285, 85, font24, float_to_string(weather.wind_speed));
+    frame_draw_string((285 + float_str_width(weather.wind_speed, font24.width)), 90, font16, "mph");
     frame_draw_compass(400, 100, weather.wind_direction_degrees, 15);
-    frame_draw_string(font16, "Cloud", 175, 125);
-    frame_draw_string(font16, "Cover", 175, 140);
-    frame_draw_image(icon_cloud_small, sizeof(icon_cloud_small), 240, 120);
-    frame_draw_string(font24, float_to_string(weather.cloudiness), 295, 130);
-    frame_draw_string(font20, "%", (295 + float_str_width(weather.cloudiness, font24.width)), 125);
+    frame_draw_string(175, 125, font16, "Cloud");
+    frame_draw_string(175, 140, font16, "Cover");
+    frame_draw_image(240, 120, icon_cloud_small, sizeof(icon_cloud_small));
+    frame_draw_string(295, 130, font24, float_to_string(weather.cloudiness));
+    frame_draw_string(295 + float_str_width(weather.cloudiness, font24.width), 125, font20, "%");
 
-    /* TODO: Quadrant 3: Graph showing temperature and precipitaion chance */
-    /*frame_draw_graph(20, 200, 470, 470, -10.0f, 110.0f,
-            forecast_hourly_temps, sizeof(forecast_hourly_temps) / sizeof(forecast_hourly_temps[0]), 5, "%.0f°",
-            forecast_hourly_precip_chances,
-            sizeof(forecast_hourly_precip_chances) / sizeof(forecast_hourly_precip_chances[0]), 5, "%.0f%%"); */
+    /* Quadrant 3: Graph showing temperature and precipitaion chance */
+    frame_draw_graph(49, 230, 391, 430, 0, 100, hourly_forecast, FORECAST_HOURS, 10, "%.0fF", "%.0f%%");
+
     /* TODO: Quadrant 4: Forecast for next few days */
 }
 
 static void rtc_gpio_init_all()
 {
-    const gpio_num_t all_pins[] = {CS_PIN, DC_PIN, RST_PIN, BUSY_PIN, MOSI_PIN, SCK_PIN, PWR_PIN};
+    const gpio_num_t all_pins[] = {CS_PIN, DC_PIN, RST_PIN, BUSY_PIN, MOSI_PIN, SCK_PIN};
     for (size_t i = 0; i < sizeof(all_pins) / sizeof(all_pins[0]); i++)
     {
         assert(rtc_gpio_is_valid_gpio(all_pins[i]));
@@ -984,7 +1124,6 @@ static void rtc_gpio_init_all()
         rtc_gpio_pullup_dis(all_pins[i]);
         gpio_intr_disable(all_pins[i]);
     }
-    rtc_gpio_set_level(PWR_PIN, HIGH);
     rtc_gpio_set_level(RST_PIN, HIGH);
 }
 
@@ -1012,18 +1151,6 @@ static void align_time_to_next_minute()
     ulp_hours = timeinfo.tm_hour % 12;
     ulp_hours = (ulp_hours == 0) ? 12 : ulp_hours;
     ulp_minutes = timeinfo.tm_min;
-}
-
-static void test_weather_data()
-{
-    weather.id = 200;
-    weather.current_temp = 72.8f;
-    weather.feels_like_temp = 75.0f;
-    weather.high_temp = 80.0f;
-    weather.low_temp = 65.0f;
-    weather.wind_speed = 15.0f;
-    weather.wind_direction_degrees = 215; // Southeast
-    weather.cloudiness = 75.0f;
 }
 
 static void task_wifi_start(void *pvParameters)
@@ -1078,23 +1205,24 @@ void app_main()
     }
 
     /* Init ULP so its variables can be accessed and modified from the main CPU */
-    esp_sleep_source_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED)
+    rtc_gpio_init_all();
+    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_ULP || wakeup_cause == ESP_SLEEP_WAKEUP_TIMER)
     {
-        rtc_gpio_init_all();
+        ulp_riscv_timer_stop();
+    } else {
         ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
         ulp_set_wakeup_period(0, 10);
         ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
-        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
-        esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
-        ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
     }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
+    ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
 
     event_group = xEventGroupCreate();
     if (event_group == NULL)
     {
-        ESP_LOGE("main", "Failed to create event group");
-        return;
+        error_handler(MEMORY_ERROR, "Failed to create event group");
     }
     xTaskCreate(task_wifi_start, "wifi_start", 4096, NULL, 5, NULL);
     xTaskCreate(task_sntp_sync_time, "sntp_sync_time", 4096, NULL, 5, NULL);
@@ -1114,6 +1242,7 @@ void app_main()
     align_time_to_next_minute();
     ulp_set_wakeup_period(0, (60ULL * 1000ULL * 1000ULL)); // 60 seconds in uS
     ulp_riscv_timer_resume();
-    esp_sleep_enable_timer_wakeup(179ULL * 60ULL * 1000ULL * 1000ULL); // 3 hours in uS
-    esp_deep_sleep_start();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ulp_wakeup());
+    esp_sleep_enable_timer_wakeup(180ULL * 60ULL * 1000ULL * 1000ULL); // 3 hours in uS
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_deep_sleep_try_to_start());
 }
