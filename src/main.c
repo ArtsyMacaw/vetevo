@@ -35,7 +35,6 @@
  * - frame_draw_byte: called by all frame drawing functions */
 
 // TODO: use espidf heap tracing to check for memory leaks
-// TODO: go through and correctly handle all the ESP_ERROR_CHECKS
 
 /* Main event group */
 static EventGroupHandle_t event_group = NULL;
@@ -47,19 +46,20 @@ static EventGroupHandle_t event_group = NULL;
 /* Error variables and definitions */
 enum error_type
 {
-    WIFI_ERROR    = 0,
-    SNTP_ERROR    = 1,
-    WEATHER_ERROR = 2,
-    EPD_ERROR     = 3,
-    MEMORY_ERROR  = 4,
-    OTHER_ERROR   = 5,
-    ASSERT        = 6,
-    NO_ERROR      = 7
+    WIFI_ERROR = 0,
+    SNTP_ERROR,
+    WEATHER_ERROR,
+    EPD_ERROR,
+    MEMORY_ERROR,
+    OTHER_ERROR,
+    ASSERT, // Used in place of assert() to allow for displaying error on display
+    NO_ERROR
 };
 static RTC_FAST_ATTR enum error_type current_error = NO_ERROR;
 static RTC_FAST_ATTR uint8_t error_count[NO_ERROR] = {0}; // Indexed by error_type enum
 static uint64_t deferred_uS = 0;
 #define MAX_ERROR_COUNT 10
+#define STRINGIFY(x) #x // Used for converting macro values to strings for logging
 
 /* Wall clock time */
 static time_t now;
@@ -91,9 +91,7 @@ extern const uint8_t bin_end[]   asm("_binary_ulp_main_bin_end");
 #define CLEAR_SKY           800
 #define CLOUDS_START        801
 
-/* Current weather conditions doesn't store all returned data from API
- * just those that are displayed */
-static struct weather_today
+static RTC_FAST_ATTR struct weather_today
 {
     uint16_t id; // Weather condition code that corresponds to an icon
     char description[32];
@@ -109,15 +107,15 @@ static struct weather_today
 } weather;
 
 #define FORECAST_HOURS 12
-static struct hourly_forecast
+static RTC_FAST_ATTR struct hourly_forecast
 {
     float temp;
     float precipitation_chance;
-    char time[6];
+    char time[6]; // "%Ip" Datetime string
 } hourly_forecast[FORECAST_HOURS];
 
 #define FORECAST_DAYS 8
-static struct weather_forecast
+static RTC_FAST_ATTR struct weather_forecast
 {
     uint16_t id;
     float high_temp;
@@ -127,345 +125,7 @@ static struct weather_forecast
 
 static uint8_t frame[EPD_HEIGHT][EPD_BYTE_WIDTH];
 
-static void error_handler(enum error_type type, const char *message)
-{
-    ESP_LOGE("error", "%s", message);
-    current_error = type;
-    error_count[type]++;
-    if (error_count[type] >= MAX_ERROR_COUNT || type == ASSERT)
-    {
-        // TODO: Show error on display and halt
-    }
-    deferred_uS = (5ULL * 1000ULL * 1000ULL) << error_count[type]; // Exponential backoff, up to ~1.5 hours
-    esp_sleep_enable_timer_wakeup(deferred_uS);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_deep_sleep_try_to_start());
-}
-
-static void error_esp(enum error_type type, esp_err_t err);
-static void error_check(bool condition, enum error_type type, const char *message);
-
-static esp_err_t http_event_handler(esp_http_client_event_t *evt)
-{
-    switch (evt->event_id)
-    {
-        case HTTP_EVENT_ERROR:
-            ESP_LOGI("http", "HTTP_EVENT_ERROR");
-            return ESP_FAIL;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGI("http", "HTTP_EVENT_ON_CONNECTED");
-            break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGI("http", "HTTP_EVENT_HEADER_SENT");
-            break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGI("http", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            break;
-        case HTTP_EVENT_ON_DATA:
-            ESP_LOGI("http", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            break;
-        case HTTP_EVENT_ON_FINISH:
-            ESP_LOGI("http", "HTTP_EVENT_ON_FINISH");
-            break;
-        case HTTP_EVENT_DISCONNECTED:
-            ESP_LOGI("http", "HTTP_EVENT_DISCONNECTED");
-            break;
-        case HTTP_EVENT_REDIRECT:
-            ESP_LOGI("http", "HTTP_EVENT_REDIRECT");
-            break;
-    }
-    return ESP_OK;
-}
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
-        esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        if (retry_num < MAX_RETRY_NUM)
-        {
-            esp_wifi_connect();
-            retry_num++;
-            ESP_LOGI("wifi", "Failed to connect to the AP, retrying... (%d/%d)", retry_num, MAX_RETRY_NUM);
-        } else {
-            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI("wifi", "Disconnected from the AP");
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static esp_netif_t *wifi_start()
-{
-    /* Default event loop must be created before create_default_wifi_sta() is called */
-    wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
-
-    /* Create Network Interface */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
-    esp_netif_t *wifi = esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_init(&cfg));
-
-    /* Setup event loop and handlers */
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(WIFI_EVENT,
-                                                                ESP_EVENT_ANY_ID,
-                                                                &wifi_event_handler,
-                                                                NULL,
-                                                                &instance_any_id));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_instance_register(IP_EVENT,
-                                                                IP_EVENT_STA_GOT_IP,
-                                                                &wifi_event_handler,
-                                                                NULL,
-                                                                &instance_got_ip));
-
-    /* Configure Wi-Fi connection and start the interface */
-    wifi_config_t wifi_config =
-    {
-        .sta =
-        {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD
-        }
-    };
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-    /* Start Wi-Fi */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_start());
-    ESP_LOGI("wifi", "Wi-Fi initialization completed.");
-
-    /* Wait for connection or failure */
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-    vEventGroupDelete(wifi_event_group);
-
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI("wifi", "Connected to AP");
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-        error_handler(WIFI_ERROR, "Failed to connect to Wi-Fi");
-    } else {
-        error_handler(WIFI_ERROR, "Unexpected event while connecting to Wi-Fi");
-    }
-
-    return wifi;
-}
-
-static void wifi_stop(esp_netif_t *netif)
-{
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_deinit());
-    esp_netif_destroy_default_wifi(netif);
-}
-
-static void https_get_weather()
-{
-    const esp_http_client_config_t config =
-    {
-        .host = "api.openweathermap.org",
-        .path = "/data/3.0/onecall?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&exclude=minutely,alerts&appid=" API_KEY,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .event_handler = http_event_handler,
-        .cert_pem = (char *)server_cert_pem_start
-    };
-    ESP_LOGI("http", "HTTP client configured with host=%s, path=%s", config.host, config.path);
-    ESP_LOGI("http", "Getting weather data...");
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_method(client, HTTP_METHOD_GET);
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK)
-    {
-        error_handler(WEATHER_ERROR, "Failed to open HTTP connection");
-    }
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length < 0)
-    {
-        error_handler(WEATHER_ERROR, "Failed to fetch HTTP headers");
-    }
-
-    char *buffer = malloc(content_length + 1);
-    assert(buffer != NULL);
-    int read_len = esp_http_client_read(client, buffer, content_length);
-    if (read_len >= 0)
-    {
-        buffer[read_len] = '\0';
-        ESP_LOGV("http", "Received data: %s", buffer);
-    }
-    else
-    {
-        error_handler(WEATHER_ERROR, "Failed to read HTTP response");
-    }
-
-    cJSON *json = cJSON_ParseWithLength(buffer, content_length);
-    if (json == NULL)
-    {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL)
-        {
-            error_handler(WEATHER_ERROR, error_ptr);
-        }
-    } else {
-        /* Assertions are used here because if the API response doesn't match the expected format then
-         * it means the API has changed and the code needs to be updated. */
-        cJSON *current = cJSON_GetObjectItem(json, "current");
-
-        cJSON *weather_array = cJSON_GetObjectItem(current, "weather");
-        assert(cJSON_IsArray(weather_array));
-        assert(cJSON_GetArraySize(weather_array) > 0);
-        cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
-              *description = cJSON_GetObjectItem(weather_item, "description"),
-              *id = cJSON_GetObjectItem(weather_item, "id");
-        assert(cJSON_IsString(description) && cJSON_IsNumber(id));
-        weather.id = id->valueint;
-        snprintf(weather.description, sizeof(weather.description), "%s", description->valuestring);
-        ESP_LOGI("weather", "Current Weather: %s (ID: %d)", weather.description, weather.id);
-
-        cJSON *temp = cJSON_GetObjectItem(current, "temp"),
-              *feels_like = cJSON_GetObjectItem(current, "feels_like");
-        assert(cJSON_IsNumber(temp) && cJSON_IsNumber(feels_like));
-        weather.current_temp = temp->valuedouble;
-        weather.feels_like_temp = feels_like->valuedouble;
-        ESP_LOGI("weather", "Current Temp: %.2f F Feels Like: %.2f F",
-                weather.current_temp, weather.feels_like_temp);
-
-        cJSON *wind_speed = cJSON_GetObjectItem(current, "wind_speed"),
-              *wind_direction = cJSON_GetObjectItem(current, "wind_deg"),
-              *cloudiness = cJSON_GetObjectItem(current, "clouds");
-        assert(cJSON_IsNumber(wind_speed) && cJSON_IsNumber(wind_direction) && cJSON_IsNumber(cloudiness));
-        weather.wind_speed = wind_speed->valuedouble;
-        weather.wind_direction_degrees = wind_direction->valueint;
-        weather.cloudiness = cloudiness->valuedouble;
-        ESP_LOGI("weather", "Wind Speed: %.2f mph at %d degrees Cloudiness: %.2f%%",
-                weather.wind_speed, weather.wind_direction_degrees, weather.cloudiness);
-
-        cJSON *sunrise = cJSON_GetObjectItem(current, "sunrise"),
-              *sunset = cJSON_GetObjectItem(current, "sunset");
-        assert(cJSON_IsNumber(sunrise) && cJSON_IsNumber(sunset));
-        weather.sunrise = sunrise->valuedouble;
-        weather.sunset = sunset->valuedouble;
-        ESP_LOGI("weather", "Sunrise: %lld, Sunset: %lld", weather.sunrise, weather.sunset);
-
-        cJSON *hourly_array = cJSON_GetObjectItem(json, "hourly");
-        assert(cJSON_IsArray(hourly_array) && (cJSON_GetArraySize(hourly_array) >= FORECAST_HOURS));
-        for (int i = 0; i < FORECAST_HOURS; i++)
-        {
-            cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i),
-                  *temp = cJSON_GetObjectItem(hourly_item, "temp"),
-                  *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop"),
-                  *dt = cJSON_GetObjectItem(hourly_item, "dt");
-            assert(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance) && cJSON_IsNumber(dt));
-            hourly_forecast[i].temp = temp->valuedouble;
-            hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
-            time_t dt_time_t = (time_t)dt->valuedouble;
-            ESP_LOGI("hourly", "Raw time for hour %d: %lld", i + 1, dt_time_t);
-            struct tm dt_timeinfo;
-            localtime_r(&dt_time_t, &dt_timeinfo);
-            strftime(hourly_forecast[i].time, sizeof(hourly_forecast[i].time), "%I%p", &dt_timeinfo);
-            ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%% at %s",
-                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100,
-                    hourly_forecast[i].time);
-        }
-        cJSON *daily_array = cJSON_GetObjectItem(json, "daily");
-        assert(cJSON_IsArray(daily_array) && (cJSON_GetArraySize(daily_array) >= FORECAST_DAYS));
-        for (int i = 0; i < FORECAST_DAYS; i++)
-        {
-            cJSON *forecast_item = cJSON_GetArrayItem(daily_array, i),
-                  *temp = cJSON_GetObjectItem(forecast_item, "temp");
-            assert(cJSON_IsObject(temp));
-
-            cJSON *temp_min = cJSON_GetObjectItem(temp, "min"),
-                  *temp_max = cJSON_GetObjectItem(temp, "max"),
-                  *precipitation_chance = cJSON_GetObjectItem(forecast_item, "pop");
-            assert(cJSON_IsNumber(temp_min) && cJSON_IsNumber(temp_max) && cJSON_IsNumber(precipitation_chance));
-            forecast[i].low_temp = temp_min->valuedouble;
-            forecast[i].high_temp = temp_max->valuedouble;
-            forecast[i].precipitation_chance = precipitation_chance->valuedouble;
-            ESP_LOGI("forecast", "Day %d Low Temp: %.2f F High Temp: %.2f F Precipitation Chance: %.2f%%",
-                    i + 1, forecast[i].low_temp, forecast[i].high_temp, forecast[i].precipitation_chance * 100);
-
-            cJSON *weather_array = cJSON_GetObjectItem(forecast_item, "weather");
-            assert(cJSON_IsArray(weather_array) && (cJSON_GetArraySize(weather_array) > 0));
-            cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
-                  *id = cJSON_GetObjectItem(weather_item, "id");
-            assert(cJSON_IsNumber(id));
-            forecast[i].id = id->valueint;
-            ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
-        }
-        weather.low_temp = forecast[0].low_temp;
-        weather.high_temp = forecast[0].high_temp;
-    }
-
-    cJSON_Delete(json);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    free(buffer);
-}
-
-static bool sntp_get_nvs_time()
-{
-    nvs_handle_t nvs_handle;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open("storage", NVS_READONLY, &nvs_handle));
-    if (nvs_get_i64(nvs_handle, "timestamp", &now) == ESP_OK)
-    {
-        ESP_LOGI("sntp", "Retrieved timestamp from NVS: %lld", now);
-        localtime_r(&now, &timeinfo);
-        nvs_close(nvs_handle);
-        return true;
-    } else {
-        ESP_LOGI("sntp", "No timestamp found in NVS");
-        nvs_close(nvs_handle);
-        return false;
-    }
-}
-
-static void sntp_set_nvs_time()
-{
-    nvs_handle_t nvs_handle;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_open("storage", NVS_READWRITE, &nvs_handle));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_i64(nvs_handle, "timestamp", now));
-    nvs_close(nvs_handle);
-    ESP_LOGI("sntp", "Saved timestamp to NVS: %lld", now);
-}
-
-static void sntp_sync_time()
-{
-    esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    esp_netif_sntp_init(&sntp_config);
-
-    /* POSIX timezones */
-    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1); // CST
-    tzset();
-
-    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)) != ESP_OK)
-    {
-        error_handler(SNTP_ERROR, "Failed to synchronize time with SNTP server");
-    } else {
-        ESP_LOGI("sntp", "Time synchronized successfully");
-    }
-    UPDATE_TIME;
-    sntp_set_nvs_time();
-    char timeinfo_str[64];
-    strftime(timeinfo_str, sizeof(timeinfo_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    ESP_LOGI("sntp", "Current time: %s", timeinfo_str);
-    esp_netif_sntp_deinit();
-}
-
+// TODO: Switch to hardware version of spi
 static void IRAM_ATTR spi_write_byte(uint8_t byte)
 {
     for (int i = 0; i < BITS_PER_BYTE; i++)
@@ -589,8 +249,6 @@ static void epd_write_frame()
     epd_wait_until_idle();
 }
 
-// TODO: Draw an error message if an unrecoverable error occurs to inform user
-
 static void epd_sleep()
 {
     spi_write_command(POWER_OFF);
@@ -599,7 +257,7 @@ static void epd_sleep()
 
 static void IRAM_ATTR frame_draw_byte(int x, int y, uint8_t byte)
 {
-    if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT)
+    if (unlikely(x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT))
     {
         ESP_LOGE("frame", "Byte position out of bounds: x=%d, y=%d", x, y);
         return;
@@ -737,7 +395,6 @@ static void frame_draw_circle(int center_x, int center_y, int radius)
     }
 }
 
-/* Bresenham Line Drawing Algorithm */
 static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
 {
     int dx  = abs(x1 - x0),
@@ -747,6 +404,8 @@ static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
         err = dx + dy,
         e2;
     bool straight_line = (dx == 0 || dy == 0);
+
+    /* For straight lines simply iterate over x/y to draw them */
     if (straight_line)
     {
         if (dy == 0)
@@ -761,7 +420,7 @@ static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
             } else {
                 for (int i = 0; i < thickness; i++)
                 {
-                    /* Recusrively draw lines on either side of the original line to create thickness,
+                    /* Recursively draw lines on either side of the original line to create thickness,
                      * alternating sides to keep it centered */
                     int8_t flip = (i % 2 == 0) ? ((i / 2) * - 1) : ((i + 1) / 2);
                     frame_draw_line(x0, y0 + flip, x1, y1 + flip, 1);
@@ -785,6 +444,7 @@ static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
         }
 
     } else {
+        /* Bresenham Line Drawing Algorithm for non straight lines */
         while (true)
         {
             frame_draw_byte(x0, y0, 0xc0);
@@ -998,6 +658,7 @@ static void frame_draw_graph(int left, int top, int right, int bottom, float min
     {
         int x = (i < (num_points - 1)) ? (x_space * i) + left : (x_space * i) + x_error + left;
         frame_draw_line(x, bottom, x, top, 1);
+        /* Draw x-axis time labels rotated otherwise they overlap with each other */
         frame_draw_rotated_string(x - 8, bottom + 8, font12, hourly_forecast[i].time);
     }
 
@@ -1106,12 +767,411 @@ static void frame_draw_default()
     /* TODO: Quadrant 4: Forecast for next few days */
 }
 
+static void error_draw_message(const char *message)
+{
+    /* Clear the frame */
+    memset(frame, 0x00, sizeof(frame));
+    /* Draw error message in the middle of the screen */
+    int x = (EPD_WIDTH - (strlen(message) * font40.width)) / 2;
+    int y = (EPD_HEIGHT - font40.height) / 2;
+    frame_draw_string(x, y, font40, message);
+    epd_init();
+    epd_write_frame();
+    epd_sleep();
+}
+
+static void error_handler(enum error_type type, const char *message)
+{
+    switch (type)
+    {
+        case WIFI_ERROR:
+            ESP_LOGE("wifi", "%s", message);
+            break;
+        case SNTP_ERROR:
+            ESP_LOGE("sntp", "%s", message);
+            break;
+        case WEATHER_ERROR:
+            ESP_LOGE("weather", "%s", message);
+            break;
+        case EPD_ERROR:
+            ESP_LOGE("epd", "%s", message);
+            break;
+        case MEMORY_ERROR:
+            ESP_LOGE("memory", "%s", message);
+            break;
+        case OTHER_ERROR:
+            ESP_LOGE("error", "%s", message);
+            break;
+        case ASSERT:
+            ESP_LOGE("assert", "%s", message);
+            break;
+        default:
+            ESP_LOGE("error", "%s", message);
+    }
+
+    current_error = type;
+    error_count[type]++;
+    if (error_count[type] >= MAX_ERROR_COUNT || type == ASSERT)
+    {
+        error_draw_message(message);
+        ulp_riscv_halt();
+        esp_sleep_enable_timer_wakeup(UINT64_MAX);
+    } else {
+        deferred_uS = (5ULL * 1000ULL * 1000ULL) << error_count[type]; // Exponential backoff, up to ~1.5 hours
+        esp_sleep_enable_timer_wakeup(deferred_uS);
+    }
+    esp_deep_sleep_start();
+}
+
+/* Reset error state, used after a successful run to allow for retries after transient errors */
+static void error_reset()
+{
+    current_error = NO_ERROR;
+    memset(error_count, 0, sizeof(error_count));
+}
+
+/* Helper function to check esp_err_t return values and call error handler if needed */
+static void error_esp(enum error_type type, esp_err_t err)
+{
+    if (unlikely(err != ESP_OK))
+    {
+        const char *error_message = esp_err_to_name(err);
+        error_handler(type, error_message);
+    }
+}
+
+
+static void error_check(bool condition, enum error_type type, const char *message)
+{
+    if (unlikely(!condition))
+    {
+        error_handler(type, message);
+    }
+}
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    switch (evt->event_id)
+    {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGI("http", "HTTP_EVENT_ERROR");
+            return ESP_FAIL;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGI("http", "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGI("http", "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGI("http", "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGI("http", "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGI("http", "HTTP_EVENT_ON_FINISH");
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI("http", "HTTP_EVENT_DISCONNECTED");
+            break;
+        case HTTP_EVENT_REDIRECT:
+            ESP_LOGI("http", "HTTP_EVENT_REDIRECT");
+            break;
+    }
+    return ESP_OK;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (retry_num < MAX_RETRY_NUM)
+        {
+            esp_wifi_connect();
+            retry_num++;
+            ESP_LOGI("wifi", "Failed to connect to the AP, retrying... (%d/%d)", retry_num, MAX_RETRY_NUM);
+        } else {
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        }
+        ESP_LOGI("wifi", "Disconnected from the AP");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_netif_t *wifi_start()
+{
+    /* Default event loop must be created before create_default_wifi_sta() is called */
+    wifi_event_group = xEventGroupCreate();
+    error_check(wifi_event_group != NULL, MEMORY_ERROR, "Failed to create Wi-Fi event group");
+    error_esp(WIFI_ERROR, esp_event_loop_create_default());
+
+    /* Create Network Interface */
+    error_esp(WIFI_ERROR, esp_netif_init());
+    esp_netif_t *wifi = esp_netif_create_default_wifi_sta();
+    error_check(wifi != NULL, MEMORY_ERROR, "Failed to create default Wi-Fi station");
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    error_esp(WIFI_ERROR, esp_wifi_init(&cfg));
+
+    /* Setup event loop and handlers */
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    error_esp(WIFI_ERROR,
+            esp_event_handler_instance_register(WIFI_EVENT,
+                                                ESP_EVENT_ANY_ID,
+                                                &wifi_event_handler,
+                                                NULL,
+                                                &instance_any_id));
+    error_esp(WIFI_ERROR,
+            esp_event_handler_instance_register(IP_EVENT,
+                                                IP_EVENT_STA_GOT_IP,
+                                                &wifi_event_handler,
+                                                NULL,
+                                                &instance_got_ip));
+
+    /* Configure Wi-Fi connection and start the interface */
+    wifi_config_t wifi_config =
+    {
+        .sta =
+        {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD
+        }
+    };
+    error_esp(WIFI_ERROR, esp_wifi_set_mode(WIFI_MODE_STA));
+    error_esp(WIFI_ERROR, esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    /* Start Wi-Fi */
+    error_esp(WIFI_ERROR, esp_wifi_start());
+    ESP_LOGI("wifi", "Wi-Fi initialization completed.");
+
+    /* Wait for connection or failure */
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+    vEventGroupDelete(wifi_event_group);
+
+    error_check((bits & WIFI_CONNECTED_BIT), WIFI_ERROR, "Failed to connect to Wi-Fi");
+    ESP_LOGI("wifi", "Connected to AP");
+
+    return wifi;
+}
+
+static void wifi_stop(esp_netif_t *netif)
+{
+    error_esp(WIFI_ERROR, esp_wifi_stop());
+    error_esp(WIFI_ERROR, esp_wifi_deinit());
+    esp_netif_destroy_default_wifi(netif);
+}
+
+static void https_get_weather()
+{
+    const esp_http_client_config_t config =
+    {
+        .host = "api.openweathermap.org",
+        .path =
+            "/data/3.0/onecall?units=imperial&lat=" LATITUDE "&lon=" LONGITUDE "&exclude=minutely,alerts&appid=" API_KEY,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .event_handler = http_event_handler,
+        .cert_pem = (char *)server_cert_pem_start
+    };
+    ESP_LOGI("http", "HTTP client configured with host=%s, path=%s", config.host, config.path);
+    ESP_LOGI("http", "Getting weather data...");
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
+    error_esp(WEATHER_ERROR, esp_http_client_open(client, 0));
+    int content_length = esp_http_client_fetch_headers(client);
+    error_check(content_length > 0, WEATHER_ERROR, "Failed to fetch HTTP headers");
+
+    char *buffer = malloc(content_length + 1);
+    error_check(buffer != NULL, MEMORY_ERROR, "Failed to allocate memory for HTTP response");
+
+    int read_len = esp_http_client_read(client, buffer, content_length);
+    error_check(read_len > 0, WEATHER_ERROR, "Failed to read HTTP response");
+    buffer[read_len] = '\0';
+    ESP_LOGV("http", "Received data: %s", buffer);
+
+    cJSON *json = cJSON_ParseWithLength(buffer, content_length);
+    if (unlikely(json == NULL))
+    {
+        const char *error_ptr = cJSON_GetErrorPtr();
+        if (error_ptr != NULL)
+        {
+            error_handler(WEATHER_ERROR, error_ptr);
+        }
+    } else {
+        /* Assertions are used here because if the API response doesn't match the expected format then
+         * it means the API has changed and the code needs to be updated. */
+        cJSON *current = cJSON_GetObjectItem(json, "current");
+
+        cJSON *weather_array = cJSON_GetObjectItem(current, "weather");
+        error_check(cJSON_IsArray(weather_array), ASSERT, "Expected 'weather' to be an array");
+        error_check(cJSON_GetArraySize(weather_array) > 0, ASSERT,
+                "Expected 'weather' array to have at least one item");
+        cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
+              *description = cJSON_GetObjectItem(weather_item, "description"),
+              *id = cJSON_GetObjectItem(weather_item, "id");
+        error_check(cJSON_IsString(description) && cJSON_IsNumber(id), ASSERT,
+                "Expected 'description' to be a string and 'id' to be a number");
+        weather.id = id->valueint;
+        snprintf(weather.description, sizeof(weather.description), "%s", description->valuestring);
+        ESP_LOGI("weather", "Current Weather: %s (ID: %d)", weather.description, weather.id);
+
+        cJSON *temp = cJSON_GetObjectItem(current, "temp"),
+              *feels_like = cJSON_GetObjectItem(current, "feels_like");
+        error_check(cJSON_IsNumber(temp) && cJSON_IsNumber(feels_like), ASSERT,
+                "Expected 'temp' and 'feels_like' to be numbers");
+        weather.current_temp = temp->valuedouble;
+        weather.feels_like_temp = feels_like->valuedouble;
+        ESP_LOGI("weather", "Current Temp: %.2f F Feels Like: %.2f F",
+                weather.current_temp, weather.feels_like_temp);
+
+        cJSON *wind_speed = cJSON_GetObjectItem(current, "wind_speed"),
+              *wind_direction = cJSON_GetObjectItem(current, "wind_deg"),
+              *cloudiness = cJSON_GetObjectItem(current, "clouds");
+        error_check(cJSON_IsNumber(wind_speed) && cJSON_IsNumber(wind_direction) && cJSON_IsNumber(cloudiness),
+                ASSERT, "Expected 'wind_speed', 'wind_deg', and 'clouds' to be numbers");
+        weather.wind_speed = wind_speed->valuedouble;
+        weather.wind_direction_degrees = wind_direction->valueint;
+        weather.cloudiness = cloudiness->valuedouble;
+        ESP_LOGI("weather", "Wind Speed: %.2f mph at %d degrees Cloudiness: %.2f%%",
+                weather.wind_speed, weather.wind_direction_degrees, weather.cloudiness);
+
+        cJSON *sunrise = cJSON_GetObjectItem(current, "sunrise"),
+              *sunset = cJSON_GetObjectItem(current, "sunset");
+        error_check(cJSON_IsNumber(sunrise) && cJSON_IsNumber(sunset), ASSERT,
+                "Expected 'sunrise' and 'sunset' to be numbers");
+        weather.sunrise = sunrise->valuedouble;
+        weather.sunset = sunset->valuedouble;
+        ESP_LOGI("weather", "Sunrise: %lld, Sunset: %lld", weather.sunrise, weather.sunset);
+
+        cJSON *hourly_array = cJSON_GetObjectItem(json, "hourly");
+        error_check(cJSON_IsArray(hourly_array), ASSERT, "Expected 'hourly' to be an array");
+        error_check(cJSON_GetArraySize(hourly_array) >= FORECAST_HOURS, ASSERT,
+                "Expected 'hourly' array to have at least " STRINGIFY(FORECAST_HOURS) " items");
+        for (int i = 0; i < FORECAST_HOURS; i++)
+        {
+            cJSON *hourly_item = cJSON_GetArrayItem(hourly_array, i),
+                  *temp = cJSON_GetObjectItem(hourly_item, "temp"),
+                  *precipitation_chance = cJSON_GetObjectItem(hourly_item, "pop"),
+                  *dt = cJSON_GetObjectItem(hourly_item, "dt");
+            error_check(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance) && cJSON_IsNumber(dt), ASSERT,
+                    "Expected 'temp', 'pop', and 'dt' to be numbers in hourly forecast");
+            hourly_forecast[i].temp = temp->valuedouble;
+            hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+            time_t dt_time_t = (time_t)dt->valuedouble;
+            ESP_LOGI("hourly", "Raw time for hour %d: %lld", i + 1, dt_time_t);
+            struct tm dt_timeinfo;
+            localtime_r(&dt_time_t, &dt_timeinfo);
+            strftime(hourly_forecast[i].time, sizeof(hourly_forecast[i].time), "%I%p", &dt_timeinfo);
+            ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%% at %s",
+                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100,
+                    hourly_forecast[i].time);
+        }
+        cJSON *daily_array = cJSON_GetObjectItem(json, "daily");
+        error_check(cJSON_IsArray(daily_array), ASSERT, "Expected 'daily' to be an array");
+        error_check(cJSON_GetArraySize(daily_array) >= FORECAST_DAYS, ASSERT,
+                "Expected 'daily' array to have at least " STRINGIFY(FORECAST_DAYS) " items");
+        for (int i = 0; i < FORECAST_DAYS; i++)
+        {
+            cJSON *forecast_item = cJSON_GetArrayItem(daily_array, i),
+                  *temp = cJSON_GetObjectItem(forecast_item, "temp");
+            error_check(cJSON_IsObject(temp), ASSERT, "Expected 'temp' to be an object in daily forecast");
+
+            cJSON *temp_min = cJSON_GetObjectItem(temp, "min"),
+                  *temp_max = cJSON_GetObjectItem(temp, "max"),
+                  *precipitation_chance = cJSON_GetObjectItem(forecast_item, "pop");
+            error_check(cJSON_IsNumber(temp_min) && cJSON_IsNumber(temp_max) && cJSON_IsNumber(precipitation_chance),
+                    ASSERT, "Expected 'min', 'max', and 'pop' to be numbers in daily forecast");
+            forecast[i].low_temp = temp_min->valuedouble;
+            forecast[i].high_temp = temp_max->valuedouble;
+            forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+            ESP_LOGI("forecast", "Day %d Low Temp: %.2f F High Temp: %.2f F Precipitation Chance: %.2f%%",
+                    i + 1, forecast[i].low_temp, forecast[i].high_temp, forecast[i].precipitation_chance * 100);
+
+            cJSON *weather_array = cJSON_GetObjectItem(forecast_item, "weather");
+            error_check(cJSON_IsArray(weather_array), ASSERT, "Expected 'weather' to be an array in daily forecast");
+            error_check(cJSON_GetArraySize(weather_array) > 0, ASSERT,
+                    "Expected 'weather' array to have at least one item in daily forecast");
+            cJSON *weather_item = cJSON_GetArrayItem(weather_array, 0),
+                  *id = cJSON_GetObjectItem(weather_item, "id");
+            error_check(cJSON_IsNumber(id), ASSERT, "Expected 'id' to be a number in daily forecast weather");
+            forecast[i].id = id->valueint;
+            ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
+        }
+        weather.low_temp = forecast[0].low_temp;
+        weather.high_temp = forecast[0].high_temp;
+    }
+
+    cJSON_Delete(json);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(buffer);
+}
+
+static bool sntp_get_nvs_time()
+{
+    nvs_handle_t nvs_handle;
+    error_esp(SNTP_ERROR, nvs_open("storage", NVS_READONLY, &nvs_handle));
+    if (nvs_get_i64(nvs_handle, "timestamp", &now) == ESP_OK)
+    {
+        ESP_LOGI("sntp", "Retrieved timestamp from NVS: %lld", now);
+        localtime_r(&now, &timeinfo);
+        nvs_close(nvs_handle);
+        return true;
+    } else {
+        ESP_LOGI("sntp", "No timestamp found in NVS");
+        nvs_close(nvs_handle);
+        return false;
+    }
+}
+
+static void sntp_set_nvs_time()
+{
+    nvs_handle_t nvs_handle;
+    error_esp(SNTP_ERROR, nvs_open("storage", NVS_READWRITE, &nvs_handle));
+    error_esp(SNTP_ERROR, nvs_set_i64(nvs_handle, "timestamp", now));
+    nvs_close(nvs_handle);
+    ESP_LOGI("sntp", "Saved timestamp to NVS: %lld", now);
+}
+
+static void sntp_sync_time()
+{
+    esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_config);
+
+    /* POSIX timezones */
+    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1); // CST
+    tzset();
+
+    error_esp(SNTP_ERROR, esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000)));
+    ESP_LOGI("sntp", "Time synchronized successfully");
+
+    UPDATE_TIME;
+    sntp_set_nvs_time();
+    char timeinfo_str[64];
+    strftime(timeinfo_str, sizeof(timeinfo_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI("sntp", "Current time: %s", timeinfo_str);
+    esp_netif_sntp_deinit();
+}
+
 static void rtc_gpio_init_all()
 {
     const gpio_num_t all_pins[] = {CS_PIN, DC_PIN, RST_PIN, BUSY_PIN, MOSI_PIN, SCK_PIN};
     for (size_t i = 0; i < sizeof(all_pins) / sizeof(all_pins[0]); i++)
     {
-        assert(rtc_gpio_is_valid_gpio(all_pins[i]));
+        error_check(rtc_gpio_is_valid_gpio(all_pins[i]), ASSERT, "Invalid GPIO pin");
         gpio_reset_pin(all_pins[i]);
         rtc_gpio_init(all_pins[i]);
         if (all_pins[i] == BUSY_PIN)
@@ -1153,6 +1213,41 @@ static void align_time_to_next_minute()
     ulp_minutes = timeinfo.tm_min;
 }
 
+static void test_weather_data()
+{
+    weather.id = 200;
+    weather.current_temp = 72.8f;
+    weather.feels_like_temp = 75.0f;
+    weather.high_temp = 80.0f;
+    weather.low_temp = 65.0f;
+    weather.wind_speed = 15.0f;
+    weather.wind_direction_degrees = 215;
+    weather.cloudiness = 75.0f;
+    for (int i = 0; i < FORECAST_HOURS; i++)
+    {
+        hourly_forecast[i].temp = 25.0f + i;
+        hourly_forecast[i].precipitation_chance = 5.0f * i;
+        hourly_forecast[i].time[0] = '1';
+        hourly_forecast[i].time[1] = '2';
+        hourly_forecast[i].time[3] = 'P';
+        hourly_forecast[i].time[4] = 'M';
+        hourly_forecast[i].time[5] = '\0';
+    }
+    for (int i = 0; i < FORECAST_DAYS; i++)
+    {
+        forecast[i].id = 500;
+        forecast[i].low_temp = 60.0f + i;
+        forecast[i].high_temp = 70.0f + i;
+        forecast[i].precipitation_chance = 10.0f * i;
+    }
+}
+
+static void test_wakeup_from_ulp()
+{
+    ulp_hours = 11;
+    ulp_minutes = 58;
+}
+
 static void task_wifi_start(void *pvParameters)
 {
     wifi_if = wifi_start();
@@ -1191,39 +1286,37 @@ static void task_https_get_weather(void *pvParameters)
 
 void app_main()
 {
-    vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for serial monitor
+    vTaskDelay(10000 / portTICK_PERIOD_MS); // Delay for serial monitor
     /* Default log level is set to ERROR to speed up boot time, set it back to INFO */
     esp_log_level_set("*", ESP_LOG_INFO);
+    rtc_gpio_init_all();
 
     /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    if (unlikely(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND))
     {
-        /* If these fail they probably can't be recovered from */
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
+        error_esp(OTHER_ERROR, nvs_flash_erase());
+        error_esp(OTHER_ERROR, nvs_flash_init());
     }
 
-    /* Init ULP so its variables can be accessed and modified from the main CPU */
-    rtc_gpio_init_all();
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+    // TODO: If woken up from ULP draw next minutes frame
     if (wakeup_cause == ESP_SLEEP_WAKEUP_ULP || wakeup_cause == ESP_SLEEP_WAKEUP_TIMER)
     {
-        ulp_riscv_timer_stop();
+        ESP_LOGI("main", "Woken up from deep sleep");
     } else {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
+        /* Init ULP so its variables can be accessed and modified from the main CPU */
+        error_esp(OTHER_ERROR, ulp_riscv_load_binary(bin_start, (bin_end - bin_start)));
         ulp_set_wakeup_period(0, 10);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(ulp_riscv_run()); // Exits immediately after starting
+        error_esp(OTHER_ERROR, ulp_riscv_run()); // Exits immediately after starting
     }
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON); // Keep GPIO pins enabled in deep sleep
     esp_sleep_pd_config(ESP_PD_DOMAIN_RC_FAST, ESP_PD_OPTION_ON); // Keep RTC fast clock on for ULP
     ulp_clk_cal = rtc_clk_cal(RTC_CAL_RTC_MUX, 1000); // Calibrate RTC clock against main one
+    error_check(ulp_clk_cal != 0, OTHER_ERROR, "Failed to calibrate RTC clock");
 
     event_group = xEventGroupCreate();
-    if (event_group == NULL)
-    {
-        error_handler(MEMORY_ERROR, "Failed to create event group");
-    }
+    error_check(event_group != NULL, MEMORY_ERROR, "Failed to create event group for task synchronization");
     xTaskCreate(task_wifi_start, "wifi_start", 4096, NULL, 5, NULL);
     xTaskCreate(task_sntp_sync_time, "sntp_sync_time", 4096, NULL, 5, NULL);
     xTaskCreate(task_https_get_weather, "https_get_weather", 65536, NULL, 5, NULL);
@@ -1242,7 +1335,9 @@ void app_main()
     align_time_to_next_minute();
     ulp_set_wakeup_period(0, (60ULL * 1000ULL * 1000ULL)); // 60 seconds in uS
     ulp_riscv_timer_resume();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_ulp_wakeup());
+
+    error_esp(OTHER_ERROR, esp_sleep_enable_ulp_wakeup());
     esp_sleep_enable_timer_wakeup(180ULL * 60ULL * 1000ULL * 1000ULL); // 3 hours in uS
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_deep_sleep_try_to_start());
+    error_reset(); // Reset error state after a successful run
+    esp_deep_sleep_start();
 }
