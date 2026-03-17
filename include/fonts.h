@@ -4,12 +4,14 @@
 #define FONTS_H
 
 /* Fonts are ASCII encoded to allow for easier character lookup */
-typedef struct {
+typedef struct
+{
     const int width;
     const int height;
     const uint8_t *table;
 } font_t;
 
+extern font_t font12;
 extern font_t font16;
 extern font_t font20;
 extern font_t font24;
@@ -18,7 +20,8 @@ extern font_t font60;
 
 /* Font60 only has 0-9, :, A, P, M for time display to save space
  * Thus isn't ASCII encoded, and the offsets need to be defined manually */
-enum {
+enum
+{
     ONE      = 0,
     TWO      = 510,
     THREE    = 1020,
