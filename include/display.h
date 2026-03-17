@@ -21,6 +21,7 @@
 #define PARTIAL_OUT         0x92
 #define CASCADE_SETTING     0xe0
 #define FORCE_TEMPERATURE   0xe5
+#define AUTO_COMMAND        0x17
 
 /* GPIO Pin mappings */
 #define MOSI_PIN    GPIO_NUM_15

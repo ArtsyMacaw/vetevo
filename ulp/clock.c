@@ -24,7 +24,8 @@ static uint8_t time[CHAR_HEIGHT][(CHAR_WIDTH * NUM_CHARS) / BITS_PER_BYTE];
 static uint8_t dst[CHAR_SIZE];
 
 /* Offsets in font60_table */
-enum {
+enum
+{
     ONE         = 0,
     TWO         = 118,
     THREE       = 258,
@@ -39,7 +40,8 @@ enum {
     TOTAL       = 1657
 };
 /* Sizes of each character's RLE data */
-enum {
+enum
+{
     ONESIZE     = TWO   - ONE,
     TWOSIZE     = THREE - TWO,
     THREESIZE   = FOUR  - THREE,
@@ -53,16 +55,14 @@ enum {
     COLONSIZE   = TOTAL - COLON
 };
 
-/* Global time variables to track the current wall clock time set by main CPU */
+/* Time variables to track the current wall clock time set by main CPU */
 volatile uint32_t hours     = 0;
 volatile uint32_t minutes   = 0;
-volatile uint32_t old_hours = 0;
-volatile uint32_t old_minutes = 0;
 
 /* RTC calibration value calculated by the main CPU */
 volatile uint32_t clk_cal = 0;
 
-/* Global debug variables to track the state of the ULP program from the main CPU */
+/* Debug variables to track the state of the ULP program from the main CPU */
 volatile uint32_t wakeups        = 0;
 volatile uint32_t launched       = 0;
 volatile uint32_t wait_flag      = 0;
@@ -70,7 +70,6 @@ volatile uint32_t bytes_written  = 0;
 volatile uint32_t epd_started    = 0;
 volatile uint32_t chars_drawn    = 0;
 volatile uint32_t frame_drawn    = 0;
-volatile uint32_t delay_ms       = 0;
 volatile uint32_t sleep_cycles   = 0;
 
 /* Decompress the RLE compressed font table */
@@ -142,13 +141,20 @@ static void epd_wait_until_idle()
     wait_flag = 0;
 }
 
-static const uint8_t
-    lut_20_partial[] = { 0x00, 30, 5, 30, 5, 1 },
-    lut_21_partial[] = { 0x00, 30, 5, 30, 5, 1 },
-    lut_22_partial[] = { 0x5a, 30, 5, 30, 5, 1 },
-    lut_23_partial[] = { 0x84, 30, 5, 30, 5, 1 },
-    lut_24_partial[] = { 0x00, 30, 5, 30, 5, 1 },
-    lut_25_partial[] = { 0x00, 30, 5, 30, 5, 1 };
+/* 5 Lut tables consisting of
+ *      1       |     6      |     36
+ * Command byte | Data bytes | Zeroed bytes */
+#define PARTIAL_LUT_SIZE 7
+#define FULL_LUT_SIZE 43
+static const uint8_t lut_partial[] =
+{
+    0x20, 0x00, 30, 5, 30, 5, 1,
+    0x21, 0x00, 30, 5, 30, 5, 1,
+    0x22, 0x5a, 30, 5, 30, 5, 1,
+    0x23, 0x84, 30, 5, 30, 5, 1,
+    0x24, 0x00, 30, 5, 30, 5, 1,
+    0x25, 0x00, 30, 5, 30, 5, 1
+};
 
 static void epd_init()
 {
@@ -188,60 +194,17 @@ static void epd_init()
     spi_write_command(VCOM_DC);
     spi_write_data(0x26);
 
-    spi_write_command(0x20);
-    for (int i = 0; i < sizeof(lut_20_partial); i++)
+    for (int i = 0; i < sizeof(lut_partial); i += PARTIAL_LUT_SIZE)
     {
-        spi_write_data(lut_20_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_20_partial)); i++)
-    {
-        spi_write_data(0x00);
-    }
-
-    spi_write_command(0x21);
-    for (int i = 0; i < sizeof(lut_21_partial); i++)
-    {
-        spi_write_data(lut_21_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_21_partial)); i++)
-    {
-        spi_write_data(0x00);
-    }
-    spi_write_command(0x22);
-    for (int i = 0; i < sizeof(lut_22_partial); i++)
-    {
-        spi_write_data(lut_22_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_22_partial)); i++)
-    {
-        spi_write_data(0x00);
-    }
-    spi_write_command(0x23);
-    for (int i = 0; i < sizeof(lut_23_partial); i++)
-    {
-        spi_write_data(lut_23_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_23_partial)); i++)
-    {
-        spi_write_data(0x00);
-    }
-    spi_write_command(0x24);
-    for (int i = 0; i < sizeof(lut_24_partial); i++)
-    {
-        spi_write_data(lut_24_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_24_partial)); i++)
-    {
-        spi_write_data(0x00);
-    }
-    spi_write_command(0x25);
-    for (int i = 0; i < sizeof(lut_25_partial); i++)
-    {
-        spi_write_data(lut_25_partial[i]);
-    }
-    for (int i = 0; i < (42 - sizeof(lut_25_partial)); i++)
-    {
-        spi_write_data(0x00);
+        spi_write_command(lut_partial[i]);
+        for (int j = 1; j < PARTIAL_LUT_SIZE; j++)
+        {
+            spi_write_data(lut_partial[i + j]);
+        }
+        for (int j = PARTIAL_LUT_SIZE; j < FULL_LUT_SIZE; j++)
+        {
+            spi_write_data(0x00);
+        }
     }
 
     spi_write_command(POWER_ON);
@@ -263,7 +226,7 @@ static void epd_full_refresh()
     spi_write_data(0x17);
     spi_write_data(0x27);
     spi_write_data(0x17);
-    spi_write_command(0x17);
+    spi_write_command(AUTO_COMMAND);
     spi_write_data(0xA5);
     epd_wait_until_idle();
     epd_sleep();
@@ -314,7 +277,6 @@ static void frame_draw_time(uint32_t hour, uint32_t minute)
             case 8:  offset = EIGHT; size = EIGHTSIZE; break;
             case 9:  offset = NINE;  size = NINESIZE;  break;
             case 10: offset = COLON; size = COLONSIZE; break;
-            default: return;
         }
         frame_draw_giant_char(offset, size, i);
     }
@@ -391,7 +353,6 @@ int main()
     if (hours == 0) // AM <-> PM transition handled by main CPU
     {
         ulp_riscv_wakeup_main_processor();
-        ulp_riscv_timer_stop();
         return 0;
     }
     launched = 1;
@@ -421,8 +382,7 @@ int main()
 
     if ((wakeups % 10) == 1)
     {
-        delay_ms = 5200 * 17.5 * 1000;
-        ulp_riscv_delay_cycles(delay_ms);
+        ulp_riscv_delay_cycles(5200 * ULP_RISCV_CYCLES_PER_MS);
     }
 }
 
