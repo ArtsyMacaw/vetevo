@@ -1718,9 +1718,9 @@ const uint8_t font16_table[] =
 
 font_t font16 =
 {
-    11, // width
-    16, // height
-    font16_table
+    .width = 11,
+    .height = 16,
+    .table = font16_table
 };
 
 // Character bitmaps for Courier New 15pt

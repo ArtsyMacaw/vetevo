@@ -3,15 +3,30 @@
 #ifndef ICONS_H
 #define ICONS_H
 
-extern const uint8_t icon_cloud[1545];
-extern const uint8_t icon_rain[1545];
-extern const uint8_t icon_drizzle[1545];
-extern const uint8_t icon_thunder[1545];
-extern const uint8_t icon_haze[1545];
-extern const uint8_t icon_snow[1545];
-extern const uint8_t icon_sun[1545];
-extern const uint8_t icon_moon[1545];
-extern const uint8_t icon_wind[240];
-extern const uint8_t icon_cloud_small[240];
+typedef struct
+{
+    int width;
+    int height;
+    uint8_t *data;
+} icon_t;
+
+extern const icon_t cloud;
+extern const icon_t drizzle;
+extern const icon_t rain;
+extern const icon_t thunder;
+extern const icon_t haze;
+extern const icon_t snow;
+extern const icon_t sun;
+extern const icon_t moon;
+extern const icon_t wind;
+extern const icon_t cloud_small;
+extern const icon_t drizzle_small;
+extern const icon_t rain_small;
+extern const icon_t thunder_small;
+extern const icon_t haze_small;
+extern const icon_t snow_small;
+extern const icon_t sun_small;
+extern const icon_t moon_small;
+extern const icon_t raindrop;
 
 #endif

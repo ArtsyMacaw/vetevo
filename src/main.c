@@ -55,6 +55,7 @@ enum error_type
     ASSERT, // Used in place of assert() to allow for displaying error on display
     NO_ERROR
 };
+/* RTC_FAST_ATTR to persist during deep sleep */
 static RTC_FAST_ATTR enum error_type current_error = NO_ERROR;
 static RTC_FAST_ATTR uint8_t error_count[NO_ERROR] = {0}; // Indexed by error_type enum
 static uint64_t deferred_uS = 0;
@@ -83,17 +84,26 @@ extern const uint8_t bin_start[] asm("_binary_ulp_main_bin_start");
 extern const uint8_t bin_end[]   asm("_binary_ulp_main_bin_end");
 
 /* Weather id definitions */
-#define THUNDERSTORM_START  200
-#define DRIZZLE_START       300
-#define RAIN_START          500
-#define SNOW_START          600
-#define ATMOSPHERE_START    700
-#define CLEAR_SKY           800
-#define CLOUDS_START        801
+enum
+{
+    THUNDERSTORM_START = 200,
+    THUNDERSTORM_END   = 232,
+    DRIZZLE_START      = 300,
+    DRIZZLE_END        = 321,
+    RAIN_START         = 500,
+    RAIN_END           = 531,
+    SNOW_START         = 600,
+    SNOW_END           = 622,
+    ATMOSPHERE_START   = 701,
+    ATMOSPHERE_END     = 781,
+    CLEAR_SKY          = 800,
+    CLOUDS_START       = 801,
+    CLOUDS_END         = 804
+};
 
 static RTC_FAST_ATTR struct weather_today
 {
-    uint16_t id; // Weather condition code that corresponds to an icon
+    uint16_t id;
     char description[32];
     float current_temp;
     float feels_like_temp;
@@ -102,8 +112,6 @@ static RTC_FAST_ATTR struct weather_today
     float wind_speed;
     uint16_t wind_direction_degrees; // Degrees from north that the wind is coming from
     float cloudiness; // % of sky covered by clouds
-    uint64_t sunrise; // Unix timestamps for sunrise/sunset
-    uint64_t sunset;
 } weather;
 
 #define FORECAST_HOURS 12
@@ -114,14 +122,15 @@ static RTC_FAST_ATTR struct hourly_forecast
     char time[6]; // "%Ip" Datetime string
 } hourly_forecast[FORECAST_HOURS];
 
-#define FORECAST_DAYS 8
+#define FORECAST_DAYS 8 // First item is current day, next 7 are forecast for next 7 days
 static RTC_FAST_ATTR struct weather_forecast
 {
     uint16_t id;
     float high_temp;
     float low_temp;
     float precipitation_chance;
-} forecast[FORECAST_DAYS]; // First item is current day, next 7 are forecast for next 7 days
+    char day[10]; // "%A" Datetime string
+} forecast[FORECAST_DAYS];
 
 static uint8_t frame[EPD_HEIGHT][EPD_BYTE_WIDTH];
 
@@ -135,7 +144,6 @@ static void IRAM_ATTR spi_write_byte(uint8_t byte)
         rtc_gpio_set_level(SCK_PIN, HIGH);
         rtc_gpio_set_level(SCK_PIN, LOW);
     }
-    rtc_gpio_set_level(CS_PIN, HIGH);
 }
 
 static void IRAM_ATTR spi_write_command(uint8_t command)
@@ -143,6 +151,7 @@ static void IRAM_ATTR spi_write_command(uint8_t command)
     rtc_gpio_set_level(DC_PIN, LOW); // Command mode
     rtc_gpio_set_level(CS_PIN, LOW);
     spi_write_byte(command);
+    rtc_gpio_set_level(CS_PIN, HIGH);
 }
 
 static void IRAM_ATTR spi_write_data(uint8_t data)
@@ -150,6 +159,7 @@ static void IRAM_ATTR spi_write_data(uint8_t data)
     rtc_gpio_set_level(DC_PIN, HIGH); // Data mode
     rtc_gpio_set_level(CS_PIN, LOW);
     spi_write_byte(data);
+    rtc_gpio_set_level(CS_PIN, HIGH);
 }
 
 static void epd_reset()
@@ -238,6 +248,7 @@ static void epd_write_frame()
 {
     epd_wait_until_idle();
     spi_write_command(TRANSFER_DATA_2);
+    rtc_gpio_set_level(CS_PIN, HIGH);
     for (size_t i = 0; i < EPD_HEIGHT; i++)
     {
         for (size_t j = 0; j < EPD_BYTE_WIDTH; j++)
@@ -357,15 +368,13 @@ static void frame_draw_string(int x, int y, font_t font, const char *str)
     }
 }
 
-static void frame_draw_image(int x, int y, const uint8_t *image_data, size_t length)
+static void frame_draw_image(int x, int y, icon_t icon)
 {
-    int height = (length == 1545) ? 103 : 40,
-        width = (length == 1545) ? 120 : 48;
-    for (int i = 0; i < height; i++)
+    for (int i = 0; i < icon.height; i++)
     {
-        for (int j = 0; j < (width / BITS_PER_BYTE); j++)
+        for (int j = 0; j < (icon.width / BITS_PER_BYTE); j++)
         {
-            uint8_t byte = image_data[i * (width / BITS_PER_BYTE) + j];
+            uint8_t byte = icon.data[i * (icon.width / BITS_PER_BYTE) + j];
             frame_draw_byte(x + (j * BITS_PER_BYTE), y + i, byte);
         }
     }
@@ -374,7 +383,6 @@ static void frame_draw_image(int x, int y, const uint8_t *image_data, size_t len
 /* Used to draw degree symbol, unecessary, but I wanted to implement the midpoint circle algorithm */
 static void frame_draw_circle(int center_x, int center_y, int radius)
 {
-    /* Midpoint circle algorithm */
     int x = radius,
         y = 0,
         decision_over_2 = 1 - x; // Decision criterion divided by 2 evaluated at x=r, y=0
@@ -471,17 +479,9 @@ static void frame_draw_dotted_rectangle(int left, int top, int right, int bottom
     frame_draw_line(right, top, right, bottom, thickness);
     frame_draw_line(left, top, right, top, thickness);
     frame_draw_line(left, bottom, right, bottom, thickness);
-    for (int i = top; i <= bottom; i += 4)
+    for (int i = left; i < right; i += 3)
     {
-        int middle = (left + right) / 2;
-        if (frame[i][middle / BITS_PER_BYTE] == 0x00 &&
-                frame[i + 1][middle / BITS_PER_BYTE] == 0x00 &&
-                frame[i - 1][middle / BITS_PER_BYTE] == 0x00)
-        {
-            frame_draw_line(left, i, right, i, thickness);
-        } else {
-            i -= 3; // Skip the next two lines to create a gap in the dotted line
-        }
+        frame_draw_line(i, top, i, bottom, thickness);
     }
 }
 
@@ -604,35 +604,34 @@ static void frame_draw_time(int x, int y)
     }
 }
 
-static void frame_draw_icon(int x, int y, uint16_t weather_id)
+static void frame_draw_icon(int x, int y, uint16_t weather_id, bool small_image)
 {
+    UPDATE_TIME;
+    bool is_daytime = (timeinfo.tm_hour >= 6 && timeinfo.tm_hour < 18);
+    icon_t icon;
+
     /* Weather condition codes documented at https://openweathermap.org/weather-conditions */
-    if (weather_id >= THUNDERSTORM_START && weather_id < DRIZZLE_START)
+    switch (weather_id)
     {
-        frame_draw_image(x, y, icon_thunder, sizeof(icon_thunder));
+        case THUNDERSTORM_START ... THUNDERSTORM_END:
+            icon = small_image ? thunder_small : thunder; break;
+        case DRIZZLE_START ... DRIZZLE_END:
+            icon = small_image ? drizzle_small : drizzle; break;
+        case RAIN_START ... RAIN_END:
+            icon = small_image ? rain_small : rain; break;
+        case SNOW_START ... SNOW_END:
+            icon = small_image ? snow_small : snow; break;
+        case ATMOSPHERE_START ... ATMOSPHERE_END:
+            icon = small_image ? haze_small : haze; break;
+        case CLEAR_SKY:
+            icon = (small_image) ? sun_small : ((is_daytime) ? sun : moon); break;
+        case CLOUDS_START ... CLOUDS_END:
+            icon = small_image ? cloud_small : cloud; break;
+        default:
+            ESP_LOGE("icon", "Unknown weather id: %d, using default cloud icon", weather_id);
+            icon = small_image ? cloud_small : cloud; break;
     }
-    else if (weather_id >= DRIZZLE_START && weather_id < RAIN_START)
-    {
-        frame_draw_image(x, y, icon_drizzle, sizeof(icon_drizzle));
-    }
-    else if (weather_id >= RAIN_START && weather_id < SNOW_START)
-    {
-        frame_draw_image(x, y, icon_rain, sizeof(icon_rain));
-    }
-    else if (weather_id >= SNOW_START && weather_id < ATMOSPHERE_START)
-    {
-        frame_draw_image(x, y, icon_snow, sizeof(icon_snow));
-    }
-    else if (weather_id >= ATMOSPHERE_START && weather_id < CLEAR_SKY)
-    {
-        frame_draw_image(x, y, icon_haze, sizeof(icon_haze));
-    }
-    else if (weather_id == CLEAR_SKY)
-    {
-        frame_draw_image(x, y, icon_sun, sizeof(icon_sun));
-    } else {
-        frame_draw_image(x, y, icon_cloud, sizeof(icon_cloud));
-    }
+    frame_draw_image(x, y, icon);
 }
 
 /* Draw graph of two sets of points with the same y-axes, used for the temperature and precipitation forecast graph
@@ -721,6 +720,25 @@ static uint16_t float_str_width(float value, uint16_t font_width)
     return str_width;
 }
 
+static void frame_draw_forecast(int x, int y, struct weather_forecast forecast)
+{
+    frame_draw_string(x, y, font24, forecast.day);
+    frame_draw_icon(x, y + 30, forecast.id, true);
+    frame_draw_arrow(x + 60, y + 45, 0, 15);
+    frame_draw_string(x + 70, y + 30, font16, float_to_string(forecast.high_temp));
+    frame_draw_circle((x + 72 + float_str_width(forecast.high_temp, font16.width)), y + 25, 2);
+    frame_draw_arrow(x + 60, y + 45, 179, 15);
+    frame_draw_string(x + 70, y + 50, font16, float_to_string(forecast.low_temp));
+    frame_draw_circle((x + 72 + float_str_width(forecast.low_temp, font16.width)), y + 45, 2);
+    if (forecast.precipitation_chance > 0)
+    {
+        frame_draw_image(x + 42, y + 70, raindrop);
+        frame_draw_string(x + 68, y + 70, font16, float_to_string(forecast.precipitation_chance));
+        frame_draw_string(x + 68 + float_str_width(forecast.precipitation_chance, font16.width), y + 70,
+                font12, "%");
+    }
+}
+
 static void frame_draw_default()
 {
     /* Quadrant 1: Current time and date */
@@ -734,7 +752,7 @@ static void frame_draw_default()
     frame_draw_time(CLOCK_X, CLOCK_Y);
 
     /* Quadrant 2: Current weather conditions */
-    frame_draw_icon(20, 20, weather.id);
+    frame_draw_icon(20, 20, weather.id, false);
     frame_draw_string(10, 130, font20, "Currently, ");
     frame_draw_string(30, 160, font40, float_to_string(weather.current_temp));
     frame_draw_circle(30 + float_str_width(weather.current_temp, font40.width), 165, 5);
@@ -746,25 +764,31 @@ static void frame_draw_default()
     frame_draw_string(260, 20, font24, float_to_string(weather.high_temp));
     frame_draw_circle((262 + float_str_width(weather.high_temp, font24.width)), 20, 3);
     frame_draw_string(175, 50, font24, " Low");
-    frame_draw_arrow(185 + (4 * font24.width), 50, 180, 20);
+    frame_draw_arrow(185 + (4 * font24.width), 50, 179, 20);
     frame_draw_string(260, 50, font24, float_to_string(weather.low_temp));
     frame_draw_circle((262 + float_str_width(weather.low_temp, font24.width)), 50, 3);
     frame_draw_string(175, 80, font16, "Wind");
     frame_draw_string(175, 95, font16, "Speed");
-    frame_draw_image(235, 75, icon_wind, sizeof(icon_wind));
+    frame_draw_image(235, 75, wind);
     frame_draw_string(285, 85, font24, float_to_string(weather.wind_speed));
-    frame_draw_string((285 + float_str_width(weather.wind_speed, font24.width)), 90, font16, "mph");
+    frame_draw_string((288 + float_str_width(weather.wind_speed, font24.width)), 90, font12, "mph");
     frame_draw_compass(400, 100, weather.wind_direction_degrees, 15);
     frame_draw_string(175, 125, font16, "Cloud");
     frame_draw_string(175, 140, font16, "Cover");
-    frame_draw_image(240, 120, icon_cloud_small, sizeof(icon_cloud_small));
+    frame_draw_image(240, 120, cloud_small);
     frame_draw_string(295, 130, font24, float_to_string(weather.cloudiness));
     frame_draw_string(295 + float_str_width(weather.cloudiness, font24.width), 125, font20, "%");
 
     /* Quadrant 3: Graph showing temperature and precipitaion chance */
-    frame_draw_graph(49, 230, 391, 430, 0, 100, hourly_forecast, FORECAST_HOURS, 10, "%.0fF", "%.0f%%");
+    frame_draw_graph(42, 240, 384, 430, 0, 100, hourly_forecast, FORECAST_HOURS, 10, "%.0fF", "%.0f%%");
 
-    /* TODO: Quadrant 4: Forecast for next few days */
+    /* Quadrant 4: Forecast for next few days */
+    frame_draw_forecast(445, 235, forecast[1]);
+    frame_draw_forecast(565, 235, forecast[2]);
+    frame_draw_forecast(685, 235, forecast[3]);
+    frame_draw_forecast(445, 360, forecast[4]);
+    frame_draw_forecast(565, 360, forecast[5]);
+    frame_draw_forecast(685, 360, forecast[6]);
 }
 
 static void error_draw_message(const char *message)
@@ -785,26 +809,19 @@ static void error_handler(enum error_type type, const char *message)
     switch (type)
     {
         case WIFI_ERROR:
-            ESP_LOGE("wifi", "%s", message);
-            break;
+            ESP_LOGE("wifi", "%s", message); break;
         case SNTP_ERROR:
-            ESP_LOGE("sntp", "%s", message);
-            break;
+            ESP_LOGE("sntp", "%s", message); break;
         case WEATHER_ERROR:
-            ESP_LOGE("weather", "%s", message);
-            break;
+            ESP_LOGE("weather", "%s", message); break;
         case EPD_ERROR:
-            ESP_LOGE("epd", "%s", message);
-            break;
+            ESP_LOGE("epd", "%s", message); break;
         case MEMORY_ERROR:
-            ESP_LOGE("memory", "%s", message);
-            break;
+            ESP_LOGE("memory", "%s", message); break;
         case OTHER_ERROR:
-            ESP_LOGE("error", "%s", message);
-            break;
+            ESP_LOGE("error", "%s", message); break;
         case ASSERT:
-            ESP_LOGE("assert", "%s", message);
-            break;
+            ESP_LOGE("assert", "%s", message); break;
         default:
             ESP_LOGE("error", "%s", message);
     }
@@ -1048,14 +1065,6 @@ static void https_get_weather()
         ESP_LOGI("weather", "Wind Speed: %.2f mph at %d degrees Cloudiness: %.2f%%",
                 weather.wind_speed, weather.wind_direction_degrees, weather.cloudiness);
 
-        cJSON *sunrise = cJSON_GetObjectItem(current, "sunrise"),
-              *sunset = cJSON_GetObjectItem(current, "sunset");
-        error_check(cJSON_IsNumber(sunrise) && cJSON_IsNumber(sunset), ASSERT,
-                "Expected 'sunrise' and 'sunset' to be numbers");
-        weather.sunrise = sunrise->valuedouble;
-        weather.sunset = sunset->valuedouble;
-        ESP_LOGI("weather", "Sunrise: %lld, Sunset: %lld", weather.sunrise, weather.sunset);
-
         cJSON *hourly_array = cJSON_GetObjectItem(json, "hourly");
         error_check(cJSON_IsArray(hourly_array), ASSERT, "Expected 'hourly' to be an array");
         error_check(cJSON_GetArraySize(hourly_array) >= FORECAST_HOURS, ASSERT,
@@ -1109,6 +1118,14 @@ static void https_get_weather()
             error_check(cJSON_IsNumber(id), ASSERT, "Expected 'id' to be a number in daily forecast weather");
             forecast[i].id = id->valueint;
             ESP_LOGI("forecast", "Day %d Weather ID: %d", i + 1, forecast[i].id);
+
+            cJSON *dt = cJSON_GetObjectItem(forecast_item, "dt");
+            error_check(cJSON_IsNumber(dt), ASSERT, "Expected 'dt' to be a number in daily forecast");
+            time_t dt_time_t = (time_t)dt->valuedouble;
+            struct tm dt_timeinfo;
+            localtime_r(&dt_time_t, &dt_timeinfo);
+            strftime(forecast[i].day, sizeof(forecast[i].day), "%a.", &dt_timeinfo);
+            ESP_LOGI("forecast", "Day %d Date: %s", i + 1, forecast[i].day);
         }
         weather.low_temp = forecast[0].low_temp;
         weather.high_temp = forecast[0].high_temp;
@@ -1169,7 +1186,7 @@ static void sntp_sync_time()
 static void rtc_gpio_init_all()
 {
     const gpio_num_t all_pins[] = {CS_PIN, DC_PIN, RST_PIN, BUSY_PIN, MOSI_PIN, SCK_PIN};
-    for (size_t i = 0; i < sizeof(all_pins) / sizeof(all_pins[0]); i++)
+    for (int i = 0; i < sizeof(all_pins) / sizeof(all_pins[0]); i++)
     {
         error_check(rtc_gpio_is_valid_gpio(all_pins[i]), ASSERT, "Invalid GPIO pin");
         gpio_reset_pin(all_pins[i]);
@@ -1213,41 +1230,6 @@ static void align_time_to_next_minute()
     ulp_minutes = timeinfo.tm_min;
 }
 
-static void test_weather_data()
-{
-    weather.id = 200;
-    weather.current_temp = 72.8f;
-    weather.feels_like_temp = 75.0f;
-    weather.high_temp = 80.0f;
-    weather.low_temp = 65.0f;
-    weather.wind_speed = 15.0f;
-    weather.wind_direction_degrees = 215;
-    weather.cloudiness = 75.0f;
-    for (int i = 0; i < FORECAST_HOURS; i++)
-    {
-        hourly_forecast[i].temp = 25.0f + i;
-        hourly_forecast[i].precipitation_chance = 5.0f * i;
-        hourly_forecast[i].time[0] = '1';
-        hourly_forecast[i].time[1] = '2';
-        hourly_forecast[i].time[3] = 'P';
-        hourly_forecast[i].time[4] = 'M';
-        hourly_forecast[i].time[5] = '\0';
-    }
-    for (int i = 0; i < FORECAST_DAYS; i++)
-    {
-        forecast[i].id = 500;
-        forecast[i].low_temp = 60.0f + i;
-        forecast[i].high_temp = 70.0f + i;
-        forecast[i].precipitation_chance = 10.0f * i;
-    }
-}
-
-static void test_wakeup_from_ulp()
-{
-    ulp_hours = 11;
-    ulp_minutes = 58;
-}
-
 static void task_wifi_start(void *pvParameters)
 {
     wifi_if = wifi_start();
@@ -1286,7 +1268,7 @@ static void task_https_get_weather(void *pvParameters)
 
 void app_main()
 {
-    vTaskDelay(10000 / portTICK_PERIOD_MS); // Delay for serial monitor
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for serial monitor
     /* Default log level is set to ERROR to speed up boot time, set it back to INFO */
     esp_log_level_set("*", ESP_LOG_INFO);
     rtc_gpio_init_all();
