@@ -72,6 +72,21 @@ volatile uint32_t chars_drawn    = 0;
 volatile uint32_t frame_drawn    = 0;
 volatile uint32_t sleep_cycles   = 0;
 
+/* 5 Lut tables consisting of
+ *      1       |     6      |     36
+ * Command byte | Data bytes | Zeroed bytes */
+#define PARTIAL_LUT_SIZE 7
+#define FULL_LUT_SIZE 43
+static const uint8_t lut_partial[] =
+{
+    0x20, 0x00, 30, 5, 30, 5, 1,
+    0x21, 0x00, 30, 5, 30, 5, 1,
+    0x22, 0x5a, 30, 5, 30, 5, 1,
+    0x23, 0x84, 30, 5, 30, 5, 1,
+    0x24, 0x00, 30, 5, 30, 5, 1,
+    0x25, 0x00, 30, 5, 30, 5, 1
+};
+
 /* Decompress the RLE compressed font table */
 void rle_decompress(const uint8_t *src, size_t src_size, size_t bit_count)
 {
@@ -103,7 +118,6 @@ static void spi_write_byte(uint8_t byte)
         ulp_riscv_gpio_output_level(SCK_PIN, HIGH);
         ulp_riscv_gpio_output_level(SCK_PIN, LOW);
     }
-    ulp_riscv_gpio_output_level(CS_PIN, HIGH);
     bytes_written++;
 }
 
@@ -112,6 +126,7 @@ static void spi_write_command(uint8_t command)
     ulp_riscv_gpio_output_level(DC_PIN, LOW);
     ulp_riscv_gpio_output_level(CS_PIN, LOW);
     spi_write_byte(command);
+    ulp_riscv_gpio_output_level(CS_PIN, HIGH);
 }
 
 static void spi_write_data(uint8_t data)
@@ -119,6 +134,7 @@ static void spi_write_data(uint8_t data)
     ulp_riscv_gpio_output_level(DC_PIN, HIGH);
     ulp_riscv_gpio_output_level(CS_PIN, LOW);
     spi_write_byte(data);
+    ulp_riscv_gpio_output_level(CS_PIN, HIGH);
 }
 
 static void epd_reset()
@@ -140,21 +156,6 @@ static void epd_wait_until_idle()
     }
     wait_flag = 0;
 }
-
-/* 5 Lut tables consisting of
- *      1       |     6      |     36
- * Command byte | Data bytes | Zeroed bytes */
-#define PARTIAL_LUT_SIZE 7
-#define FULL_LUT_SIZE 43
-static const uint8_t lut_partial[] =
-{
-    0x20, 0x00, 30, 5, 30, 5, 1,
-    0x21, 0x00, 30, 5, 30, 5, 1,
-    0x22, 0x5a, 30, 5, 30, 5, 1,
-    0x23, 0x84, 30, 5, 30, 5, 1,
-    0x24, 0x00, 30, 5, 30, 5, 1,
-    0x25, 0x00, 30, 5, 30, 5, 1
-};
 
 static void epd_init()
 {
