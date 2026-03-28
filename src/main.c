@@ -3,6 +3,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "soc/adc_channel.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -55,8 +58,7 @@ enum error_type
     ASSERT, // Used in place of assert() to allow for displaying error on display
     NO_ERROR
 };
-/* RTC_FAST_ATTR to persist during deep sleep */
-static RTC_FAST_ATTR enum error_type current_error = NO_ERROR;
+static RTC_FAST_ATTR enum error_type current_error = NO_ERROR; // RTC_FAST_ATTR persists deep sleep
 static RTC_FAST_ATTR uint8_t error_count[NO_ERROR] = {0}; // Indexed by error_type enum
 static uint64_t deferred_uS = 0;
 #define MAX_ERROR_COUNT 10
@@ -74,6 +76,10 @@ static esp_netif_t *wifi_if = NULL;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 #define MAX_RETRY_NUM      5
+
+/* Battery definitions and variables */
+static uint8_t battery_percentage = 0;
+#define BATTERY_THRESHOLD 10 // Percentage at which the battery is considered critically low
 
 /* Root server certificate for api.openweathermap.org embedded by CMake */
 extern const uint8_t server_cert_pem_start[] asm("_binary_openweather_pem_start");
@@ -472,7 +478,7 @@ static void frame_draw_line(int x0, int y0, int x1, int y1, int thickness)
     }
 }
 
-/* Draws a rectangle with an x in the middle of it */
+/* Draws a rectangle with vertical lines */
 static void frame_draw_dotted_rectangle(int left, int top, int right, int bottom, int thickness)
 {
     frame_draw_line(left, top, left, bottom, thickness);
@@ -575,11 +581,11 @@ static void frame_draw_time(int x, int y)
     {
         (hour / 10) % 10,
         hour % 10,
-        10,
+        10, // ':' character
         (minute / 10) % 10,
         minute % 10,
         afternoon ? 11 : 12,
-        13
+        13 // 'M' character
     };
 
     for (int i = 0; i < sizeof(time); i++)
@@ -739,6 +745,32 @@ static void frame_draw_forecast(int x, int y, struct weather_forecast forecast)
     }
 }
 
+static void frame_draw_battery(int left, int top, int right, int bottom, uint8_t percentage)
+{
+    int tail_width = (right - left) / 10,
+        tail_height = (bottom - top) / 3,
+        body_width = (right - left) - tail_width,
+        body_height = bottom - top,
+        fill_point = (int)((percentage / 100.0f) * body_width);
+    /* Draw battery body */
+    frame_draw_line(left, top, left, bottom, 2);
+    frame_draw_line(left, top, left + body_width, top, 2);
+    frame_draw_line(left + body_width, top, left + body_width, bottom, 2);
+    frame_draw_line(left, bottom, left + body_width + 2, bottom, 2);
+    /* Draw battery tail */
+    frame_draw_line(right - tail_width, top + tail_height, right, top + tail_height, 2);
+    frame_draw_line(right - tail_width,
+            top + tail_height + tail_height, right + 2, top + tail_height + tail_height, 2);
+    frame_draw_line(right, top + tail_height, right, top + tail_height + tail_height, 2);
+    /* Draw battery level */
+    for (int i = top; i < bottom; i++)
+    {
+        frame_draw_line(left, i, left + fill_point, i, 1);
+    }
+    frame_draw_string(right + 4, top + 2, font12, float_to_string(percentage));
+     frame_draw_string(right + 4 + float_str_width(percentage, font12.width), top + 2, font12, "%");
+}
+
 static void frame_draw_default()
 {
     /* Quadrant 1: Current time and date */
@@ -750,6 +782,7 @@ static void frame_draw_default()
     strftime(timeinfo_str, sizeof(timeinfo_str), "%B %d, %Y", &timeinfo);
     frame_draw_string(470, 50, font24, timeinfo_str);
     frame_draw_time(CLOCK_X, CLOCK_Y);
+    frame_draw_battery(730, 5, 770, 20, battery_percentage);
 
     /* Quadrant 2: Current weather conditions */
     frame_draw_icon(20, 20, weather.id, false);
@@ -866,6 +899,46 @@ static void error_check(bool condition, enum error_type type, const char *messag
     }
 }
 
+static uint32_t battery_get_voltage()
+{
+    int voltage;
+    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_init_cfg_t adc_config =
+    {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc_config, &adc_handle));
+    adc_oneshot_chan_cfg_t adc_chan_config =
+    {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC1_GPIO5_CHANNEL, &adc_chan_config));
+    adc_cali_handle_t cali_handle;
+    adc_cali_curve_fitting_config_t cali_config =
+    {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle));
+    ESP_ERROR_CHECK(adc_oneshot_get_calibrated_result(adc_handle, cali_handle, ADC1_GPIO5_CHANNEL, &voltage));
+    ESP_LOGI("battery", "Battery voltage: %dmV", (voltage * 2));
+
+    return (voltage * 2); // Voltage divider halves the voltage for measurement, so multiply by 2 to get actual voltage
+}
+
+static uint8_t battery_get_percentage()
+{
+    float voltage = ((float)battery_get_voltage()) / 1000, // Convert mV to V
+        /* Polynomial regression to fit the discharge curve of a typical Lipo battery, clamped to 0-100% */
+          percentage = 123 - (123 / pow((1 + pow((voltage / 3.7), 80)), 0.165));
+    uint8_t percentage_clamped = (percentage < 0) ? 0 : ((percentage > 100) ? 100 : (uint8_t)round(percentage));
+    ESP_LOGI("battery", "Battery percentage: %d%%", percentage_clamped);
+    return percentage_clamped;
+}
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id)
@@ -934,7 +1007,6 @@ static esp_netif_t *wifi_start()
     error_esp(WIFI_ERROR, esp_netif_init());
     esp_netif_t *wifi = esp_netif_create_default_wifi_sta();
     error_check(wifi != NULL, MEMORY_ERROR, "Failed to create default Wi-Fi station");
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     error_esp(WIFI_ERROR, esp_wifi_init(&cfg));
 
@@ -1078,14 +1150,14 @@ static void https_get_weather()
             error_check(cJSON_IsNumber(temp) && cJSON_IsNumber(precipitation_chance) && cJSON_IsNumber(dt), ASSERT,
                     "Expected 'temp', 'pop', and 'dt' to be numbers in hourly forecast");
             hourly_forecast[i].temp = temp->valuedouble;
-            hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble;
+            hourly_forecast[i].precipitation_chance = precipitation_chance->valuedouble * 100;
             time_t dt_time_t = (time_t)dt->valuedouble;
             ESP_LOGI("hourly", "Raw time for hour %d: %lld", i + 1, dt_time_t);
             struct tm dt_timeinfo;
             localtime_r(&dt_time_t, &dt_timeinfo);
             strftime(hourly_forecast[i].time, sizeof(hourly_forecast[i].time), "%I%p", &dt_timeinfo);
             ESP_LOGI("hourly", "Hour %d Temp: %.2f F Precipitation Chance: %.2f%% at %s",
-                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance * 100,
+                    i + 1, hourly_forecast[i].temp, hourly_forecast[i].precipitation_chance,
                     hourly_forecast[i].time);
         }
         cJSON *daily_array = cJSON_GetObjectItem(json, "daily");
@@ -1272,6 +1344,9 @@ void app_main()
     /* Default log level is set to ERROR to speed up boot time, set it back to INFO */
     esp_log_level_set("*", ESP_LOG_INFO);
     rtc_gpio_init_all();
+
+    battery_percentage = battery_get_percentage();
+    error_check((battery_percentage > BATTERY_THRESHOLD), OTHER_ERROR, "Battery percentage is critically low");
 
     /* Wi-Fi requires NVS flash to store credentials otherwise it will fail to initialize */
     esp_err_t ret = nvs_flash_init();
